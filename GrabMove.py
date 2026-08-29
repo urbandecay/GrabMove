@@ -7,6 +7,7 @@ core.  It uses the public view event and placement APIs:
 * ``X``, ``Y`` or ``Z`` constrains the translation to a global axis.
 * Type a numeric distance after an axis to enter an exact displacement;
   Backspace edits it and the live X/Y/Z displacement HUD stays visible.
+  Numeric keypad view shortcuts are captured while the modal move is active.
 * ``B`` enters snap-source mode.  Click a point on the selected object, then
   hover and click a point on another object to align the two points.
 * Left mouse/Enter confirms; right mouse/Escape cancels.
@@ -21,6 +22,7 @@ the Body's final translation immediately before recompute.
 
 from __future__ import print_function
 
+import ctypes
 import os
 import time
 import traceback
@@ -102,6 +104,27 @@ def _qt_modules():
     except ImportError:
         from PySide6 import QtCore, QtGui, QtWidgets
         return QtCore, QtGui, QtWidgets
+
+
+class _XcbKeyPressEvent(ctypes.Structure):
+    """Small prefix of xcb_key_press_event_t used by the native filter."""
+
+    _fields_ = (
+        ("response_type", ctypes.c_ubyte),
+        ("detail", ctypes.c_ubyte),
+        ("sequence", ctypes.c_ushort),
+        ("time", ctypes.c_uint32),
+        ("root", ctypes.c_uint32),
+        ("event", ctypes.c_uint32),
+        ("child", ctypes.c_uint32),
+        ("root_x", ctypes.c_int16),
+        ("root_y", ctypes.c_int16),
+        ("event_x", ctypes.c_int16),
+        ("event_y", ctypes.c_int16),
+        ("state", ctypes.c_ushort),
+        ("same_screen", ctypes.c_ubyte),
+        ("pad0", ctypes.c_ubyte),
+    )
 
 
 def _text(value):
@@ -866,6 +889,38 @@ class GrabMoveSession(object):
             return
         except Exception:
             _debug("ActiveView viewer widget focus path unavailable")
+
+        # v26.3 does not expose getWidget() on the Python viewer wrapper, but
+        # the same QOpenGLWidget can be found through the Qt view hierarchy.
+        # Focusing it is important: otherwise mouse motion reaches Coin while
+        # typed distances can remain focused on the tree or property editor.
+        try:
+            widget = self.hud_viewport
+            if widget is None:
+                _QtCore, _QtGui, QtWidgets = _qt_modules()
+                widget = self._find_viewport_widget(QtWidgets)
+            if widget is not None:
+                try:
+                    QtCore, _QtGui, _QtWidgets = _qt_modules()
+                    strong_focus = _qt_enum(
+                        QtCore.Qt, "StrongFocus", "FocusPolicy"
+                    )
+                    if strong_focus is not None:
+                        widget.setFocusPolicy(strong_focus)
+                except Exception:
+                    pass
+                widget.setFocus()
+                _debug(
+                    "focus set through Qt viewport widget class=%s"
+                    % (
+                        _text(widget.metaObject().className())
+                        if hasattr(widget, "metaObject")
+                        else type(widget).__name__
+                    )
+                )
+                return
+        except Exception:
+            _debug("Qt viewport focus path unavailable")
 
         try:
             self.view.setFocus()
@@ -1855,6 +1910,19 @@ class GrabMoveSession(object):
             )
             self._update_hud()
 
+    def _handle_qt_key(self, key):
+        """Handle a key captured before FreeCAD's view shortcut dispatcher."""
+
+        if self.done:
+            return
+        self._handle_keyboard(
+            {
+                "Type": "SoKeyboardEvent",
+                "Key": _text(key).upper(),
+                "State": "DOWN",
+            }
+        )
+
     def _handle_mouse(self, event):
         if _event_state(event) not in ("", "DOWN", "PRESS"):
             return
@@ -1889,6 +1957,28 @@ class GrabMoveSession(object):
                     )
                 )
                 self.finish(True)
+                return
+
+            # B selects the source point, but it must not force the user to
+            # find a second snap point.  If the cursor is over empty space,
+            # _update_snap_target() already applied the free-space view-point
+            # translation; the click should commit that placement just like a
+            # normal Grab Move click does.  Only ignore the click when there
+            # is no usable 3D point at all.
+            free_point = (
+                self._view_point(position) if position is not None else None
+            )
+            if free_point is not None:
+                _debug(
+                    "free-space target confirmed point=(%.3f, %.3f, %.3f)"
+                    % (free_point.x, free_point.y, free_point.z)
+                )
+                self.finish(True)
+            else:
+                _debug(
+                    "free-space target click ignored: no 3D point at %s"
+                    % (position,)
+                )
 
     def _handle_event(self, event):
         if self.done or not isinstance(event, dict):
@@ -2152,10 +2242,155 @@ def install_gui():
                 except Exception:
                     return False
 
+            def _modal_key(self, event):
+                """Map a Qt key press to the key names used by GrabMove."""
+
+                try:
+                    blocking_modifiers = 0
+                    for modifier_name in (
+                        "ShiftModifier",
+                        "ControlModifier",
+                        "AltModifier",
+                        "MetaModifier",
+                    ):
+                        modifier = _qt_enum(
+                            QtCore.Qt, modifier_name, "KeyboardModifier"
+                        )
+                        if modifier is not None:
+                            blocking_modifiers |= int(modifier)
+                    if int(event.modifiers()) & blocking_modifiers:
+                        return None
+                except Exception:
+                    pass
+
+                try:
+                    text = str(event.text() or "")
+                except Exception:
+                    text = ""
+                if len(text) == 1 and text in "0123456789.-+":
+                    return text
+
+                for digit in "0123456789":
+                    qt_key = _qt_enum(QtCore.Qt, "Key_" + digit, "Key")
+                    if qt_key is not None and event.key() == qt_key:
+                        return digit
+
+                key_names = (
+                    ("Key_Period", "."),
+                    ("Key_Decimal", "."),
+                    ("Key_Minus", "-"),
+                    ("Key_Plus", "+"),
+                    ("Key_Backspace", "BACKSPACE"),
+                    ("Key_Delete", "DELETE"),
+                    ("Key_Return", "RETURN"),
+                    ("Key_Enter", "ENTER"),
+                    ("Key_Escape", "ESCAPE"),
+                    ("Key_X", "X"),
+                    ("Key_Y", "Y"),
+                    ("Key_Z", "Z"),
+                    ("Key_B", "B"),
+                )
+                for qt_name, key_name in key_names:
+                    qt_key = _qt_enum(QtCore.Qt, qt_name, "Key")
+                    if qt_key is not None and event.key() == qt_key:
+                        return key_name
+
+                # On X11 some physical keypad presses arrive with an
+                # unknown Qt key while the native keysym still identifies
+                # KP_0..KP_9.  Coin then reports those presses as Key=ANY,
+                # which is too late for the addon to recover the digit.
+                try:
+                    native_virtual_key = int(event.nativeVirtualKey())
+                except Exception:
+                    native_virtual_key = 0
+                keypad_keysyms = {
+                    0xFFB0: "0",
+                    0xFFB1: "1",
+                    0xFFB2: "2",
+                    0xFFB3: "3",
+                    0xFFB4: "4",
+                    0xFFB5: "5",
+                    0xFFB6: "6",
+                    0xFFB7: "7",
+                    0xFFB8: "8",
+                    0xFFB9: "9",
+                    0xFFAE: ".",
+                    0xFFAB: "+",
+                    0xFFAD: "-",
+                    0xFF8D: "ENTER",
+                }
+                if native_virtual_key in keypad_keysyms:
+                    return keypad_keysyms[native_virtual_key]
+
+                # Some X11/evdev combinations expose the keypad hardware
+                # scan code instead of the keysym.  Use this table only when
+                # Qt marks the event as a keypad event so normal number-row
+                # scan codes cannot be mistaken for distance input.
+                try:
+                    keypad_modifier = _qt_enum(
+                        QtCore.Qt, "KeypadModifier", "KeyboardModifier"
+                    )
+                    is_keypad = (
+                        keypad_modifier is not None
+                        and int(event.modifiers()) & int(keypad_modifier)
+                    )
+                except Exception:
+                    is_keypad = False
+                if is_keypad:
+                    try:
+                        scan_code = int(event.nativeScanCode())
+                    except Exception:
+                        scan_code = 0
+                    keypad_scan_codes = {
+                        79: "7", 80: "8", 81: "9",
+                        83: "4", 84: "5", 85: "6",
+                        87: "1", 88: "2", 89: "3",
+                        90: "0", 91: ".",
+                    }
+                    if scan_code in keypad_scan_codes:
+                        return keypad_scan_codes[scan_code]
+                return None
+
             def eventFilter(self, _watched, event):
                 try:
                     key_press = _qt_enum(QtCore.QEvent, "KeyPress", "Type")
                     if event.type() != key_press:
+                        return False
+
+                    if self._is_text_editor_focused():
+                        return False
+
+                    session = getattr(App, SESSION_ATTRIBUTE, None)
+                    if session is not None:
+                        modal_key = self._modal_key(event)
+                        if modal_key is not None:
+                            _debug(
+                                "application modal key captured key=%s"
+                                % modal_key
+                            )
+                            session._handle_qt_key(modal_key)
+                            return True
+
+                        try:
+                            _debug(
+                                "application modal key not mapped qt=%s text=%r "
+                                "modifiers=%s native=%s scan=%s"
+                                % (
+                                    event.key(),
+                                    str(event.text() or ""),
+                                    event.modifiers(),
+                                    event.nativeVirtualKey(),
+                                    event.nativeScanCode(),
+                                )
+                            )
+                        except Exception:
+                            pass
+
+                        key_g = _qt_enum(QtCore.Qt, "Key_G", "Key")
+                        if event.key() == key_g:
+                            _debug(
+                                "application G ignored: modal session already active"
+                            )
                         return False
 
                     key_g = _qt_enum(QtCore.Qt, "Key_G", "Key")
@@ -2166,12 +2401,6 @@ def install_gui():
                         QtCore.Qt, "NoModifier", "KeyboardModifier"
                     )
                     if no_modifier is not None and event.modifiers() != no_modifier:
-                        return False
-                    if self._is_text_editor_focused():
-                        return False
-
-                    if getattr(App, SESSION_ATTRIBUTE, None) is not None:
-                        _debug("application G ignored: modal session already active")
                         return False
                     if not is_moveable_selection():
                         _debug(
@@ -2197,6 +2426,205 @@ def install_gui():
         application.installEventFilter(shortcut_filter)
         App._GrabMoveShortcutFilter = shortcut_filter
         _debug("application G event filter installed")
+
+        # On the X11/xcb backend, some physical keypad keys are consumed by
+        # the Coin viewer before Qt produces a useful QKeyEvent.  Coin then
+        # reports them as Key=ANY and FreeCAD interprets the same key as a
+        # camera-view shortcut.  A native filter runs one layer earlier and
+        # can translate the X11 keysym while the modal move is active.
+        old_native_filter = getattr(App, "_GrabMoveNativeEventFilter", None)
+        if old_native_filter is not None:
+            try:
+                application.removeNativeEventFilter(old_native_filter)
+            except Exception:
+                pass
+            try:
+                old_native_filter.close()
+            except Exception:
+                pass
+
+        class _GrabMoveNativeEventFilter(QtCore.QAbstractNativeEventFilter):
+            """Capture modal X11 keys before Qt/Coin dispatches them."""
+
+            _MODAL_KEYSYMS = {
+                0x0030: "0",
+                0x0031: "1",
+                0x0032: "2",
+                0x0033: "3",
+                0x0034: "4",
+                0x0035: "5",
+                0x0036: "6",
+                0x0037: "7",
+                0x0038: "8",
+                0x0039: "9",
+                0x002E: ".",
+                0x002B: "+",
+                0x002D: "-",
+                0x0067: "G",
+                0x0078: "X",
+                0x0079: "Y",
+                0x007A: "Z",
+                0x0062: "B",
+                0xFF08: "BACKSPACE",  # XK_BackSpace
+                0xFFFF: "DELETE",  # XK_Delete
+                0xFF0D: "RETURN",  # XK_Return
+                0xFF1B: "ESCAPE",  # XK_Escape
+                0xFFB0: "0",  # XK_KP_0
+                0xFFB1: "1",  # XK_KP_1
+                0xFFB2: "2",  # XK_KP_2
+                0xFFB3: "3",  # XK_KP_3
+                0xFFB4: "4",  # XK_KP_4
+                0xFFB5: "5",  # XK_KP_5
+                0xFFB6: "6",  # XK_KP_6
+                0xFFB7: "7",  # XK_KP_7
+                0xFFB8: "8",  # XK_KP_8
+                0xFFB9: "9",  # XK_KP_9
+                0xFFAE: ".",  # XK_KP_Decimal
+                0xFFAB: "+",  # XK_KP_Add
+                0xFFAD: "-",  # XK_KP_Subtract
+                0xFF8D: "ENTER",  # XK_KP_Enter
+            }
+
+            def __init__(self, app, qt_filter):
+                super().__init__()
+                self.app = app
+                self.qt_filter = qt_filter
+                self.x11 = None
+                self.display = None
+                self._open_x11()
+
+            def _open_x11(self):
+                try:
+                    platform_name = _text(self.app.platformName()).lower()
+                except Exception:
+                    platform_name = ""
+                if "xcb" not in platform_name:
+                    _debug(
+                        "native keypad filter skipped: Qt platform=%s"
+                        % platform_name
+                    )
+                    return
+                try:
+                    self.x11 = ctypes.CDLL("libX11.so.6")
+                    self.x11.XOpenDisplay.restype = ctypes.c_void_p
+                    self.x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+                    self.x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+                    self.x11.XKeycodeToKeysym.argtypes = [
+                        ctypes.c_void_p,
+                        ctypes.c_uint,
+                        ctypes.c_int,
+                    ]
+                    self.x11.XKeycodeToKeysym.restype = ctypes.c_ulong
+                    self.display = self.x11.XOpenDisplay(None)
+                except Exception:
+                    self.x11 = None
+                    self.display = None
+                    _debug(
+                        "native keypad filter unavailable:\n%s"
+                        % traceback.format_exc()
+                    )
+                    return
+                if not self.display:
+                    _debug("native keypad filter unavailable: XOpenDisplay failed")
+                    self.x11 = None
+                    return
+                _debug("native X11 keypad event filter installed")
+
+            def close(self):
+                if self.display is not None and self.x11 is not None:
+                    try:
+                        self.x11.XCloseDisplay(self.display)
+                    except Exception:
+                        pass
+                self.display = None
+                self.x11 = None
+
+            def _keysym_name(self, keycode):
+                if self.x11 is None or self.display is None:
+                    return None
+                # Keypad layouts normally use columns 0 and 1 for the
+                # navigation and NumLock forms.  Check both so the modal
+                # numeric entry remains usable with either NumLock state.
+                for column in range(4):
+                    try:
+                        keysym = int(
+                            self.x11.XKeycodeToKeysym(
+                                self.display, int(keycode), column
+                            )
+                        )
+                    except Exception:
+                        continue
+                    key_name = self._MODAL_KEYSYMS.get(keysym)
+                    if key_name is not None:
+                        return key_name
+                return None
+
+            def nativeEventFilter(self, event_type, message):
+                try:
+                    event_name = _text(event_type).lower()
+                    if "xcb" not in event_name:
+                        return False, 0
+
+                    if self.qt_filter._is_text_editor_focused():
+                        return False, 0
+
+                    message_address = int(message)
+                    if not message_address:
+                        return False, 0
+                    native_event = ctypes.cast(
+                        message_address,
+                        ctypes.POINTER(_XcbKeyPressEvent),
+                    ).contents
+                    # XCB event type 2 is KeyPress.  Bit 7 is set for a
+                    # synthetic SendEvent wrapper and does not change it.
+                    if (int(native_event.response_type) & 0x7F) != 2:
+                        return False, 0
+
+                    # Ignore ordinary modifier chords.  NumLock is a
+                    # separate X11 modifier and is intentionally allowed.
+                    if int(native_event.state) & (1 | 4 | 8 | 64 | 128):
+                        return False, 0
+
+                    key_name = self._keysym_name(native_event.detail)
+                    if key_name is None:
+                        return False, 0
+
+                    session = getattr(App, SESSION_ATTRIBUTE, None)
+                    if session is None or getattr(session, "done", True):
+                        if key_name != "G" or not is_moveable_selection():
+                            return False, 0
+                        _debug("native application key captured key=G")
+                        result = Gui.runCommand(COMMAND_NAME)
+                        _debug(
+                            "Gui.runCommand(%s) returned %s"
+                            % (COMMAND_NAME, result)
+                        )
+                        return True, 0
+
+                    _debug(
+                        "native modal key captured key=%s keycode=%s"
+                        % (key_name, int(native_event.detail))
+                    )
+                    session._handle_qt_key(key_name)
+                    return True, 0
+                except Exception:
+                    _debug(
+                        "native keypad filter failed:\n%s"
+                        % traceback.format_exc()
+                    )
+                    return False, 0
+
+        native_filter = _GrabMoveNativeEventFilter(application, shortcut_filter)
+        try:
+            application.installNativeEventFilter(native_filter)
+            App._GrabMoveNativeEventFilter = native_filter
+        except Exception:
+            native_filter.close()
+            App._GrabMoveNativeEventFilter = None
+            _debug(
+                "native keypad filter installation failed:\n%s"
+                % traceback.format_exc()
+            )
     else:
         _debug("GUI setup warning: no QApplication instance")
 
