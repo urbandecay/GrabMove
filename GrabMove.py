@@ -751,13 +751,27 @@ class GrabMoveSession(object):
             _debug("ActiveView.setFocus() unavailable")
 
     def _install_scene_markers(self):
-        # Do not mutate Coin's scene graph while a SoEvent callback is active.
-        # Removing a temporary node from the graph during the Escape/confirm
-        # event can leave Coin traversing a detached child and crash FreeCAD.
-        # The snap state is still shown in the status bar; visual markers can
-        # be added later through a deferred, non-modal update.
         self.marker_root = None
-        _debug("scene markers disabled during modal event handling")
+        if coin is None:
+            _debug("scene markers unavailable: pivy.coin is not installed")
+            return
+        if (
+            self.source_marker.separator is None
+            or self.target_marker.separator is None
+        ):
+            _debug("scene markers unavailable: marker nodes could not be created")
+            return
+
+        try:
+            marker_root = coin.SoSeparator()
+            marker_root.addChild(self.source_marker.separator)
+            marker_root.addChild(self.target_marker.separator)
+            self.view.getSceneGraph().addChild(marker_root)
+            self.marker_root = marker_root
+            _debug("scene markers installed before modal callback")
+        except Exception:
+            self.marker_root = None
+            _debug("scene marker installation failed:\n%s" % traceback.format_exc())
 
     def _remove_scene_markers(self):
         if self.marker_root is None:
@@ -1111,6 +1125,18 @@ class GrabMoveSession(object):
                 )
             )
 
+    def _update_source_marker(self):
+        """Keep the yellow source marker attached to the moving object."""
+
+        if self.source_local is None:
+            return
+
+        try:
+            current_source = self.preview_global.multVec(self.source_local)
+            self.source_marker.set_point(current_source)
+        except Exception:
+            _debug("source marker update failed:\n%s" % traceback.format_exc())
+
     def _sync_body_binders(self, final_local):
         """Make internal ShapeBinders follow the Body's committed translation."""
 
@@ -1204,6 +1230,7 @@ class GrabMoveSession(object):
         self.target_marker.hide()
         self.target_hit = None
         self.phase = "snap_target"
+        _debug("source marker placed at selected snap point")
         _debug(
             "snap source selected object=%s component=%s point=(%.3f, %.3f, %.3f)"
             % (
@@ -1213,7 +1240,7 @@ class GrabMoveSession(object):
             )
         )
         self._status(
-            "Grab Move: source set — hover a target object and click | "
+            "Grab Move: source set (yellow marker) — hover a target and click | "
             "X/Y/Z constrain | Esc cancel"
         )
         return True
@@ -1248,6 +1275,7 @@ class GrabMoveSession(object):
         self._apply_global_translation(
             self.snap_baseline_global, _constrain(delta, self.axis)
         )
+        self._update_source_marker()
 
     def _set_axis(self, key):
         if key not in ("X", "Y", "Z"):

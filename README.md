@@ -9,6 +9,8 @@ modal move command:
   hover a point on another object, and click again to align the two points.
 - Snapping searches a small magnetic radius around the cursor, prioritizes
   nearby vertices and edges, and briefly holds a target once acquired.
+- After the source click in `B` mode, a yellow marker stays on the selected
+  source point while the target is chosen.
 - Left mouse or Enter confirms. Right mouse or Escape cancels.
 - A selected Body moves during the grab. On confirmation, its internal
   ShapeBinders receive the same final translation before recompute, preventing
