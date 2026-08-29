@@ -534,22 +534,6 @@ def _straight_edge_midpoint(obj, edge_index):
         return None
 
 
-def _face_center(obj, face_index):
-    """Return a face's area-center point in world space."""
-
-    face = _shape_element(obj, "Faces", face_index)
-    if face is None:
-        return None
-
-    try:
-        center = face.CenterOfMass
-        if callable(center):
-            center = center()
-        return _shape_point_to_global(obj, center)
-    except Exception:
-        return None
-
-
 def _axis_vector(axis):
     if axis == "X":
         return App.Vector(1.0, 0.0, 0.0)
@@ -1045,16 +1029,10 @@ class GrabMoveSession(object):
             if point is not None:
                 return point, "Edge%d midpoint" % (edge_index + 1)
 
-        face_index = _component_index(component, "Face")
-        if face_index is not None:
-            point = _face_center(obj, face_index)
-            if point is not None:
-                return point, "Face%d center" % (face_index + 1)
-
         return None
 
     def _enrich_snap_hit(self, hit, sample, center, sample_index):
-        """Add search metadata and use a nearby edge/face center when found."""
+        """Add search metadata and use a nearby edge midpoint when found."""
 
         dx = float(sample[0] - center[0])
         dy = float(sample[1] - center[1])
