@@ -210,6 +210,128 @@ def _parent_geo_feature_group(obj):
         return None
 
 
+def _is_binder_object(obj):
+    if obj is None:
+        return False
+    return "ShapeBinder" in _text(getattr(obj, "TypeId", ""))
+
+
+def _linked_objects(value):
+    """Yield document objects from Link, LinkSub, and LinkSubList values."""
+
+    if value is None:
+        return
+    if hasattr(value, "Name") and hasattr(value, "Document"):
+        yield value
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            for linked in _linked_objects(item):
+                yield linked
+
+
+def _group_members(root):
+    """Return a Body and all of the features contained by its Group tree."""
+
+    members = []
+    pending = [root]
+    visited = set()
+    while pending:
+        current = pending.pop()
+        key = _object_key(current)
+        if key in visited:
+            continue
+        visited.add(key)
+        members.append(current)
+        try:
+            pending.extend(list(getattr(current, "Group", []) or []))
+        except Exception:
+            pass
+    return members
+
+
+def _binder_supports_body(binder, body, body_keys):
+    try:
+        support = binder.Support
+    except Exception:
+        return False
+
+    for linked in _linked_objects(support):
+        if _object_key(linked) in body_keys:
+            return True
+
+        # A support may itself be a nested PartDesign feature whose parent
+        # group is the selected Body even when it is not exposed in Group.
+        current = linked
+        visited = set()
+        for _index in range(32):
+            key = _object_key(current)
+            if key in visited:
+                break
+            visited.add(key)
+            parent = _parent_geo_feature_group(current)
+            if parent is None:
+                break
+            if _same_object(parent, body):
+                return True
+            current = parent
+    return False
+
+
+def _binder_for_body(body):
+    """Find an external ShapeBinder that depends on ``body``."""
+
+    if body is None or "Body" not in _text(getattr(body, "TypeId", "")):
+        return None
+
+    body_members = _group_members(body)
+    body_keys = set(_object_key(member) for member in body_members)
+    try:
+        document_objects = list(body.Document.Objects)
+    except Exception:
+        return None
+
+    candidates = []
+    for candidate in document_objects:
+        if not _is_binder_object(candidate):
+            continue
+        parent = _parent_geo_feature_group(candidate)
+        if parent is not None and _same_object(parent, body):
+            # A binder inside the selected Body is local to that Body; the
+            # special redirect is only for an external tether.
+            continue
+        if _binder_supports_body(candidate, body, body_keys):
+            candidates.append(candidate)
+
+    if not candidates:
+        return None
+
+    visible = []
+    for candidate in candidates:
+        try:
+            if candidate.ViewObject.Visibility:
+                visible.append(candidate)
+        except Exception:
+            pass
+    selected = (visible or candidates)[0]
+    _debug(
+        "tether redirect body=%s binder=%s candidates=%s"
+        % (
+            _object_key(body),
+            _object_key(selected),
+            [_object_key(item) for item in candidates],
+        )
+    )
+    return selected
+
+
+def _effective_moveable_object(obj):
+    if _is_binder_object(obj):
+        return obj
+    binder = _binder_for_body(obj)
+    return binder if binder is not None else obj
+
+
 def _resolve_moveable_object(obj):
     """Resolve a selected PartDesign feature to its owning Body.
 
@@ -219,7 +341,7 @@ def _resolve_moveable_object(obj):
     """
 
     if _is_moveable_object(obj):
-        return obj
+        return _effective_moveable_object(obj)
 
     current = obj
     visited = set()
@@ -232,7 +354,7 @@ def _resolve_moveable_object(obj):
         if current is None:
             break
         if _is_moveable_object(current):
-            return current
+            return _effective_moveable_object(current)
     return None
 
 
