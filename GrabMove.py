@@ -343,6 +343,23 @@ def _event_button(event):
     return _text(event.get("Button", event.get("button", ""))).upper()
 
 
+def _component_priority(component):
+    """Prefer precise topological snap elements over broad surfaces."""
+
+    name = _text(component).lower()
+    if "vertex" in name:
+        return 0
+    if "edge" in name:
+        return 1
+    if "wire" in name:
+        return 2
+    if "face" in name:
+        return 3
+    if "solid" in name:
+        return 4
+    return 5
+
+
 class _Marker(object):
     """A lightweight point marker added temporarily to the active scene."""
 
@@ -427,6 +444,7 @@ class GrabMoveSession(object):
         self.marker_root = None
         self.debug_event_count = 0
         self.debug_move_count = 0
+        self.debug_snap_query_count = 0
         self.source_marker = _Marker((1.0, 0.75, 0.1))
         self.target_marker = _Marker((0.1, 0.9, 1.0))
         _debug(
@@ -675,17 +693,48 @@ class GrabMoveSession(object):
                 pass
         return False
 
+    def _pick_snap_hit(self, screen_position, source):
+        """Pick the frontmost object, then its most precise hit component."""
+
+        hits = self._objects_at(screen_position)
+        candidates = []
+        for hit in hits:
+            belongs = self._belongs_to_moving_object(hit["object"])
+            if belongs == source:
+                candidates.append(hit)
+
+        self.debug_snap_query_count += 1
+        if not candidates:
+            if (
+                self.debug_snap_query_count <= 3
+                or self.debug_snap_query_count % 25 == 0
+            ):
+                _debug(
+                    "snap %s query at %s: no candidate (raw_hits=%d)"
+                    % ("source" if source else "target", screen_position, len(hits))
+                )
+            return None
+
+        # getObjectsInfo returns records in view/depth order. Keep the first
+        # matching object so a hidden object behind the visible one cannot win
+        # merely because it has a Vertex record. Among that object's records,
+        # choose Vertex before Edge before Face; FreeCAD commonly returns a
+        # Face record before the more useful exact Vertex record.
+        front_object = _object_key(candidates[0]["object"])
+        front_hits = [
+            hit for hit in candidates
+            if _object_key(hit["object"]) == front_object
+        ]
+        return min(
+            front_hits,
+            key=lambda hit: _component_priority(hit.get("component", "")),
+        )
+
     def _pick_source(self, screen_position):
-        for hit in self._objects_at(screen_position):
-            if self._belongs_to_moving_object(hit["object"]):
-                return hit
-        return None
+        return self._pick_snap_hit(screen_position, True)
 
     def _pick_target(self, screen_position):
-        for hit in self._objects_at(screen_position):
-            if not self._belongs_to_moving_object(hit["object"]):
-                return hit
-        return None
+        return self._pick_snap_hit(screen_position, False)
 
     def _apply_global_translation(self, baseline, delta):
         desired = _copy_placement(baseline)
@@ -842,6 +891,8 @@ class GrabMoveSession(object):
             self.snap_baseline_global = _copy_placement(self.preview_global)
             self.source_marker.hide()
             self.target_marker.hide()
+            if self.last_screen_position is not None:
+                self._update_source_hover(self.last_screen_position)
             self._status(
                 "Grab Move: B mode — hover a point on the selected Body/ShapeBinder "
                 "and click"
