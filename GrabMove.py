@@ -38,6 +38,7 @@ COMMAND_ATTRIBUTE = "_GrabMoveCommand"
 PARAMETER_PATH = "User parameter:BaseApp/Preferences/Mod/GrabMove"
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "GrabMove-debug.log")
+DEFAULT_SNAP_RADIUS_PIXELS = 12
 
 
 def _debug_enabled():
@@ -64,6 +65,20 @@ def _debug(message):
         App.Console.PrintMessage(line)
     except Exception:
         pass
+
+
+def _snap_radius_pixels():
+    """Read the magnetic snap search radius from preferences."""
+
+    try:
+        radius = int(
+            App.ParamGet(PARAMETER_PATH).GetInt(
+                "SnapRadiusPixels", DEFAULT_SNAP_RADIUS_PIXELS
+            )
+        )
+    except Exception:
+        radius = DEFAULT_SNAP_RADIUS_PIXELS
+    return max(0, min(radius, 64))
 
 
 def _qt_enum(container, name, nested_name=None):
@@ -525,6 +540,26 @@ def _component_priority(component):
     return 5
 
 
+def _snap_sample_positions(screen_position, radius):
+    """Return a small screen-space grid used for magnetic snap searching."""
+
+    x = int(screen_position[0])
+    y = int(screen_position[1])
+    if radius <= 0:
+        return [(x, y)]
+
+    # A 3x3 grid gives coverage across the full radius without requiring a
+    # large number of ray-pick calls.  The center is first so exact hits keep
+    # their normal behavior when no nearby precise component is present.
+    step = max(1, int(round(float(radius) * 2.0 / 3.0)))
+    offsets = (
+        (0, 0),
+        (-step, 0), (step, 0), (0, -step), (0, step),
+        (-step, -step), (-step, step), (step, -step), (step, step),
+    )
+    return [(x + dx, y + dy) for dx, dy in offsets]
+
+
 class _Marker(object):
     """A lightweight point marker added temporarily to the active scene."""
 
@@ -630,6 +665,10 @@ class GrabMoveSession(object):
         self.debug_event_count = 0
         self.debug_move_count = 0
         self.debug_snap_query_count = 0
+        self.snap_radius_pixels = _snap_radius_pixels()
+        self.snap_release_pixels = (
+            self.snap_radius_pixels + 6 if self.snap_radius_pixels else 0
+        )
         self.source_marker = _Marker((1.0, 0.75, 0.1))
         self.target_marker = _Marker((0.1, 0.9, 1.0))
         _debug(
@@ -937,56 +976,112 @@ class GrabMoveSession(object):
                     pass
         return False
 
+    def _sticky_target_hit(self, screen_position):
+        """Keep a recently acquired target while the cursor is still nearby."""
+
+        if self.snap_release_pixels <= 0:
+            return None
+
+        previous = self.target_hit
+        if not isinstance(previous, dict):
+            return None
+        previous_position = previous.get("snap_screen_position")
+        if previous_position is None:
+            return None
+
+        dx = float(screen_position[0]) - float(previous_position[0])
+        dy = float(screen_position[1]) - float(previous_position[1])
+        if dx * dx + dy * dy > self.snap_release_pixels ** 2:
+            return None
+
+        sticky = dict(previous)
+        sticky["snap_screen_distance"] = (dx * dx + dy * dy) ** 0.5
+        sticky["snap_sticky"] = True
+        return sticky
+
     def _pick_snap_hit(self, screen_position, source):
-        """Pick the frontmost object, then its most precise hit component."""
+        """Pick a nearby snap component using a small screen-space search."""
 
-        hits = self._objects_at(screen_position)
+        if screen_position is None:
+            return None
+
+        center = (int(screen_position[0]), int(screen_position[1]))
+        samples = _snap_sample_positions(center, self.snap_radius_pixels)
+        hits = []
         candidates = []
-        for hit in hits:
-            belongs = self._belongs_to_moving_object(hit["object"])
-            if belongs == source:
-                candidates.append(hit)
+        for sample_index, sample in enumerate(samples):
+            sample_hits = self._objects_at(sample)
+            dx = float(sample[0] - center[0])
+            dy = float(sample[1] - center[1])
+            sample_distance = (dx * dx + dy * dy) ** 0.5
+            for hit in sample_hits:
+                enriched = dict(hit)
+                enriched["snap_screen_position"] = sample
+                enriched["snap_screen_distance"] = sample_distance
+                enriched["snap_sample_index"] = sample_index
+                hits.append(enriched)
 
-        # B is an explicit request to choose a source point.  If FreeCAD's
-        # hit record does not expose the selected Body's ownership (common for
-        # linked/tip display paths), keep the frontmost visible point instead
-        # of rejecting the click outright.  The normal ownership match above
-        # always wins when available.
+                # Off-center face/solid hits describe a broad surface rather
+                # than a nearby snap point. Keep them for an explicit B
+                # fallback, but only use precise components for magnetic
+                # searching away from the exact cursor position.
+                if sample_distance > 0.0 and _component_priority(
+                    hit.get("component", "")
+                ) > 2:
+                    continue
+                belongs = self._belongs_to_moving_object(hit["object"])
+                if belongs == source:
+                    candidates.append(enriched)
+
+        self.debug_snap_query_count += 1
+
+        # B is an explicit request to choose a source point. If FreeCAD's hit
+        # record does not expose the selected Body's ownership (common for
+        # linked/tip display paths), keep the nearest visible point instead of
+        # rejecting the click outright. The normal ownership match wins when
+        # available.
         if source and not candidates and hits:
-            candidates = [hits[0]]
+            candidates = list(hits)
             _debug(
                 "snap source ownership fallback object=%s component=%s"
                 % (
-                    _object_key(hits[0]["object"]),
-                    hits[0]["component"] or "point",
+                    _object_key(candidates[0]["object"]),
+                    candidates[0]["component"] or "point",
                 )
             )
 
-        self.debug_snap_query_count += 1
+        if not candidates and not source:
+            sticky = self._sticky_target_hit(center)
+            if sticky is not None:
+                return sticky
+
         if not candidates:
             if (
                 self.debug_snap_query_count <= 3
                 or self.debug_snap_query_count % 25 == 0
             ):
                 _debug(
-                    "snap %s query at %s: no candidate (raw_hits=%d)"
-                    % ("source" if source else "target", screen_position, len(hits))
+                    "snap %s query at %s: no candidate (raw_hits=%d samples=%d radius=%d)"
+                    % (
+                        "source" if source else "target",
+                        screen_position,
+                        len(hits),
+                        len(samples),
+                        self.snap_radius_pixels,
+                    )
                 )
             return None
 
-        # getObjectsInfo returns records in view/depth order. Keep the first
-        # matching object so a hidden object behind the visible one cannot win
-        # merely because it has a Vertex record. Among that object's records,
-        # choose Vertex before Edge before Face; FreeCAD commonly returns a
-        # Face record before the more useful exact Vertex record.
-        front_object = _object_key(candidates[0]["object"])
-        front_hits = [
-            hit for hit in candidates
-            if _object_key(hit["object"]) == front_object
-        ]
+        # Prefer the most precise component in the search area. Distance is
+        # the tie-breaker, so a nearby Vertex beats a broad Face under the
+        # cursor while two Vertices choose the one closest to the cursor.
         return min(
-            front_hits,
-            key=lambda hit: _component_priority(hit.get("component", "")),
+            candidates,
+            key=lambda hit: (
+                _component_priority(hit.get("component", "")),
+                hit.get("snap_screen_distance", 0.0),
+                hit.get("snap_sample_index", 0),
+            ),
         )
 
     def _pick_source(self, screen_position):
