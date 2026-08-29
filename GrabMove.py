@@ -5,6 +5,8 @@ core.  It uses the public view event and placement APIs:
 
 * ``G`` starts a modal translation.
 * ``X``, ``Y`` or ``Z`` constrains the translation to a global axis.
+* Type a numeric distance after an axis to enter an exact displacement;
+  Backspace edits it and the live X/Y/Z displacement HUD stays visible.
 * ``B`` enters snap-source mode.  Click a point on the selected object, then
   hover and click a point on another object to align the two points.
 * Left mouse/Enter confirms; right mouse/Escape cancels.
@@ -608,6 +610,27 @@ def _event_button(event):
     return _text(event.get("Button", event.get("button", ""))).upper()
 
 
+def _numeric_key_value(key):
+    """Return the typed numeric character represented by a Coin key name."""
+    value = _text(key).upper()
+    if len(value) == 1 and value.isdigit():
+        return value
+
+    for prefix in ("KP_", "KP", "NUM_"):
+        if value.startswith(prefix):
+            suffix = value[len(prefix):]
+            if len(suffix) == 1 and suffix.isdigit():
+                return suffix
+
+    if value in (".", "PERIOD", "DECIMAL", "KP_PERIOD", "KP_DECIMAL"):
+        return "."
+    if value in ("-", "MINUS", "SUBTRACT", "KP_MINUS", "KP_SUBTRACT"):
+        return "-"
+    if value in ("+", "PLUS", "ADD", "KP_PLUS", "KP_ADD"):
+        return "+"
+    return None
+
+
 def _component_priority(component):
     """Prefer precise topological snap elements over broad surfaces."""
 
@@ -738,6 +761,18 @@ class GrabMoveSession(object):
         self.initial_cursor_world = None
         self.last_screen_position = None
 
+        # Keyboard distance entry is an optional override of the live mouse
+        # displacement on the selected axis.  An empty buffer means that the
+        # mouse controls the distance again.
+        self.numeric_buffer = ""
+        self.numeric_value = None
+
+        # A Qt label is used for the live displacement readout.  Keeping this
+        # out of the Coin scene graph avoids changing the scene graph while a
+        # Coin event callback is active.
+        self.hud_label = None
+        self.hud_viewport = None
+
         self.snap_baseline_global = None
         self.source_world = None
         self.source_local = None
@@ -787,6 +822,8 @@ class GrabMoveSession(object):
 
         self._install_scene_markers()
         _debug("scene markers installed=%s" % (self.marker_root is not None))
+        self._install_hud()
+        self._update_hud()
 
         try:
             self.callback_id = self.view.addEventCallback(
@@ -795,6 +832,7 @@ class GrabMoveSession(object):
             _debug("SoEvent callback installed id=%s" % self.callback_id)
         except Exception:
             self._remove_scene_markers()
+            self._remove_hud()
             if self.transaction_open:
                 try:
                     self.document.abortTransaction()
@@ -882,6 +920,353 @@ class GrabMoveSession(object):
                 main.statusBar().clearMessage()
         except Exception:
             pass
+
+    def _install_hud(self):
+        """Install a small, mouse-transparent displacement readout."""
+
+        self.hud_label = None
+        try:
+            QtCore, QtGui, QtWidgets = _qt_modules()
+            label_class = getattr(QtWidgets, "QLabel", None)
+            if label_class is None:
+                label_class = getattr(QtGui, "QLabel", None)
+            if label_class is None:
+                _debug("distance HUD unavailable: QLabel is not exposed")
+                return
+
+            parent = None
+            parent_source = ""
+            try:
+                viewer = self.view.getViewer()
+                parent = viewer.getWidget()
+                parent_source = "active viewer widget"
+            except Exception:
+                pass
+            if parent is None:
+                parent = self._find_viewport_widget(QtWidgets)
+                parent_source = "Gui::View3DInventor hierarchy"
+            if parent is None:
+                _debug("distance HUD unavailable: no 3D viewport widget")
+                return
+
+            # Never attach the readout to the main window.  That makes it
+            # appear in the application corner instead of in the modeling
+            # viewport when a viewer wrapper is unavailable.
+            try:
+                class_name = _text(parent.metaObject().className()).lower()
+                if "mainwindow" in class_name:
+                    _debug("distance HUD unavailable: viewer returned main window")
+                    return
+            except Exception:
+                pass
+
+            label = label_class(parent)
+            try:
+                label.setObjectName("GrabMoveDistanceHud")
+            except Exception:
+                pass
+            try:
+                transparent_attribute = _qt_enum(
+                    QtCore.Qt,
+                    "WA_TransparentForMouseEvents",
+                    "WidgetAttribute",
+                )
+                if transparent_attribute is not None:
+                    label.setAttribute(transparent_attribute, True)
+            except Exception:
+                pass
+            try:
+                label.setStyleSheet(
+                    "QLabel { color: #ffffff; "
+                    "background-color: rgba(25, 25, 25, 215); "
+                    "border: 1px solid #888888; padding: 6px; }"
+                )
+            except Exception:
+                pass
+            self.hud_viewport = parent
+            self.hud_label = label
+            label.show()
+            self._position_hud()
+            try:
+                label.raise_()
+            except Exception:
+                pass
+            try:
+                viewport_class = _text(parent.metaObject().className())
+            except Exception:
+                viewport_class = type(parent).__name__
+            try:
+                viewport_name = _text(parent.objectName())
+            except Exception:
+                viewport_name = ""
+            _debug(
+                "distance HUD installed inside viewport (%s) class=%s object=%s"
+                % (parent_source, viewport_class, viewport_name)
+            )
+        except Exception:
+            _debug("distance HUD installation failed:\n%s" % traceback.format_exc())
+
+    def _find_viewport_widget(self, QtWidgets):
+        """Find the actual GL viewport when getViewer().getWidget() is hidden."""
+
+        try:
+            main = Gui.getMainWindow()
+            if main is None:
+                return None
+
+            candidates = []
+            try:
+                active_window = main.activeWindow()
+                if active_window is not None:
+                    candidates.append(active_window)
+            except Exception:
+                pass
+
+            try:
+                widget_class = getattr(QtWidgets, "QWidget", None)
+                if widget_class is not None:
+                    candidates.extend(main.findChildren(widget_class))
+            except Exception:
+                pass
+
+            seen = set()
+            for candidate in candidates:
+                marker = id(candidate)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                try:
+                    class_name = _text(candidate.metaObject().className())
+                except Exception:
+                    continue
+                if class_name != "Gui::View3DInventor":
+                    continue
+
+                try:
+                    descendants = candidate.findChildren(QtWidgets.QWidget)
+                except Exception:
+                    descendants = []
+
+                # In newer FreeCAD builds the Coin viewer's Python wrapper
+                # does not expose getWidget().  The actual OpenGL widget is
+                # still present below Gui::View3DInventor and is the best
+                # parent for a readout drawn over the 3D scene.
+                for child in descendants:
+                    try:
+                        child_class = _text(child.metaObject().className())
+                    except Exception:
+                        continue
+                    if child_class in ("QOpenGLWidget", "QGLWidget"):
+                        return child
+
+                for child in descendants:
+                    try:
+                        child_class = _text(child.metaObject().className())
+                    except Exception:
+                        continue
+                    if child_class == "Gui::View3DInventorViewer":
+                        return child
+
+                # View3DInventor contains a QStackedWidget whose current
+                # child is the real Coin/OpenGL viewport.  Parenting the HUD
+                # to that child keeps it inside the modeling area.
+                try:
+                    central = candidate.centralWidget()
+                    current = central.currentWidget()
+                    if current is not None:
+                        return current
+                    if central is not None:
+                        return central
+                except Exception:
+                    pass
+                return candidate
+        except Exception:
+            _debug("viewport widget lookup failed:\n%s" % traceback.format_exc())
+        return None
+
+    def _remove_hud(self):
+        label = self.hud_label
+        self.hud_label = None
+        self.hud_viewport = None
+        if label is None:
+            return
+        try:
+            label.hide()
+        except Exception:
+            pass
+        try:
+            label.deleteLater()
+        except Exception:
+            pass
+
+    def _position_hud(self):
+        """Keep the readout inside the active 3D viewport, near its top center."""
+
+        if self.hud_label is None or self.hud_viewport is None:
+            return
+        try:
+            self.hud_label.adjustSize()
+            width = int(self.hud_viewport.width())
+            height = int(self.hud_viewport.height())
+            label_width = int(self.hud_label.width())
+            x = max(12, int((width - label_width) / 2))
+            y = 20 if height > 60 else 8
+            self.hud_label.move(x, y)
+        except Exception:
+            pass
+
+    def _preview_delta(self):
+        try:
+            return _copy_vector(
+                self.preview_global.Base - self.original_global.Base
+            )
+        except Exception:
+            return App.Vector(0.0, 0.0, 0.0)
+
+    def _update_hud(self):
+        if self.hud_label is None:
+            return
+        try:
+            delta = self._preview_delta()
+            axis_text = self.axis if self.axis is not None else "free"
+            if self.numeric_buffer:
+                input_text = "Input: %s" % self.numeric_buffer
+            else:
+                input_text = "Input: mouse"
+            self.hud_label.setText(
+                "Grab Move\n"
+                "X: %+.3f mm\n"
+                "Y: %+.3f mm\n"
+                "Z: %+.3f mm\n"
+                "Axis: %s\n"
+                "%s"
+                % (
+                    float(delta.x),
+                    float(delta.y),
+                    float(delta.z),
+                    axis_text,
+                    input_text,
+                )
+            )
+            self.hud_label.adjustSize()
+            self._position_hud()
+            self.hud_label.raise_()
+        except Exception:
+            # The HUD is optional; never let a widget update interrupt a move.
+            pass
+
+    def _reset_numeric_input(self):
+        self.numeric_buffer = ""
+        self.numeric_value = None
+
+    def _delta_with_numeric(self, delta):
+        constrained = _constrain(delta, self.axis)
+        if self.numeric_value is not None and self.axis is not None:
+            return _axis_vector(self.axis) * float(self.numeric_value)
+        return constrained
+
+    def _apply_numeric_value(self):
+        """Apply an entered distance immediately when a move baseline exists."""
+
+        if self.numeric_value is None or self.axis is None:
+            return False
+
+        delta = _axis_vector(self.axis) * float(self.numeric_value)
+        if self.phase == "move":
+            self._apply_global_translation(self.original_global, delta)
+            return True
+        if self.phase == "snap_target" and self.snap_baseline_global is not None:
+            self._apply_global_translation(self.snap_baseline_global, delta)
+            self._update_source_marker()
+            return True
+        return False
+
+    def _reapply_current_position(self):
+        if self.phase == "move" and self.last_screen_position is not None:
+            self._update_move(self.last_screen_position)
+        elif (
+            self.phase == "snap_target"
+            and self.last_screen_position is not None
+        ):
+            self._update_snap_target(self.last_screen_position)
+        elif self.phase == "move":
+            self._apply_global_translation(
+                self.original_global, App.Vector(0.0, 0.0, 0.0)
+            )
+        elif self.phase == "snap_target" and self.snap_baseline_global is not None:
+            self._apply_global_translation(
+                self.snap_baseline_global, App.Vector(0.0, 0.0, 0.0)
+            )
+            self._update_source_marker()
+        else:
+            self._update_hud()
+
+    def _handle_numeric_input(self, key):
+        """Consume a numeric key while an axis-constrained move is active."""
+
+        if self.phase not in ("move", "pick_source", "snap_target"):
+            return False
+
+        if self.axis is None:
+            if key in (
+                "BACKSPACE",
+                "BACK",
+                "DELETE",
+                "DEL",
+            ) or _numeric_key_value(key) is not None:
+                self._status(
+                    "Grab Move: press X, Y, or Z before entering a distance"
+                )
+                return True
+            return False
+
+        if key in ("BACKSPACE", "BACK"):
+            self.numeric_buffer = self.numeric_buffer[:-1]
+            if self.numeric_buffer:
+                try:
+                    self.numeric_value = float(self.numeric_buffer)
+                except (TypeError, ValueError):
+                    self.numeric_value = None
+            else:
+                self.numeric_value = None
+            self._reapply_current_position()
+            self._status(
+                "Grab Move: %s distance %s | Enter accept | Backspace edit"
+                % (self.axis, self.numeric_buffer or "mouse")
+            )
+            return True
+
+        character = _numeric_key_value(key)
+        if character is None:
+            return False
+
+        current = self.numeric_buffer
+        if character in ("+", "-") and current:
+            return True
+        if character == "." and "." in current:
+            return True
+
+        candidate = current + character
+        self.numeric_buffer = candidate
+        try:
+            self.numeric_value = float(candidate)
+        except (TypeError, ValueError):
+            # A leading sign or decimal point is valid partial input.
+            self.numeric_value = None
+
+        if self.numeric_value is not None:
+            self._apply_numeric_value()
+        else:
+            self._update_hud()
+        self._status(
+            "Grab Move: %s distance %s | Enter accept | Backspace edit"
+            % (self.axis, self.numeric_buffer)
+        )
+        _debug(
+            "numeric input axis=%s buffer=%s value=%s"
+            % (self.axis, self.numeric_buffer, self.numeric_value)
+        )
+        return True
 
     def _view_point(self, screen_position):
         if screen_position is None:
@@ -1257,6 +1642,7 @@ class GrabMoveSession(object):
             raise RuntimeError("The selected object has a read-only Placement")
 
         self.preview_global = desired
+        self._update_hud()
         self.debug_move_count += 1
         if self.debug_move_count <= 3 or self.debug_move_count % 25 == 0:
             _debug(
@@ -1327,11 +1713,10 @@ class GrabMoveSession(object):
         self.last_screen_position = screen_position
         if self.initial_cursor_world is None:
             self.initial_cursor_world = world
-            return
 
         delta = world - self.initial_cursor_world
         self._apply_global_translation(
-            self.original_global, _constrain(delta, self.axis)
+            self.original_global, self._delta_with_numeric(delta)
         )
 
     def _update_source_hover(self, screen_position):
@@ -1373,6 +1758,7 @@ class GrabMoveSession(object):
         self.target_marker.hide()
         self.target_hit = None
         self.phase = "snap_target"
+        self._apply_numeric_value()
         _debug("source marker placed at selected snap point")
         _debug(
             "snap source selected object=%s component=%s point=(%.3f, %.3f, %.3f)"
@@ -1416,7 +1802,7 @@ class GrabMoveSession(object):
             )
 
         self._apply_global_translation(
-            self.snap_baseline_global, _constrain(delta, self.axis)
+            self.snap_baseline_global, self._delta_with_numeric(delta)
         )
         self._update_source_marker()
 
@@ -1424,6 +1810,7 @@ class GrabMoveSession(object):
         if key not in ("X", "Y", "Z"):
             return
         self.axis = None if self.axis == key else key
+        self._reset_numeric_input()
         axis_text = self.axis if self.axis is not None else "free"
 
         if self.phase == "move" and self.last_screen_position is not None:
@@ -1432,6 +1819,7 @@ class GrabMoveSession(object):
             self._update_snap_target(self.last_screen_position)
         else:
             self._status("Grab Move: constraint %s" % axis_text)
+            self._update_hud()
 
     def _handle_keyboard(self, event):
         if _event_state(event) not in ("", "DOWN", "PRESS"):
@@ -1451,8 +1839,11 @@ class GrabMoveSession(object):
         if key in ("X", "Y", "Z"):
             self._set_axis(key)
             return
+        if self._handle_numeric_input(key):
+            return
         if key == "B" and self.phase == "move":
             self.phase = "pick_source"
+            self._reset_numeric_input()
             self.snap_baseline_global = _copy_placement(self.preview_global)
             self.source_marker.hide()
             self.target_marker.hide()
@@ -1462,6 +1853,7 @@ class GrabMoveSession(object):
                 "Grab Move: B mode — hover a point on the selected Body/ShapeBinder "
                 "and click"
             )
+            self._update_hud()
 
     def _handle_mouse(self, event):
         if _event_state(event) not in ("", "DOWN", "PRESS"):
@@ -1592,6 +1984,7 @@ class GrabMoveSession(object):
             self.callback_id = None
 
         self._remove_scene_markers()
+        self._remove_hud()
 
         if commit:
             # Apply the Body's final translation to its internal synchronized
