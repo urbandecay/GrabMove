@@ -449,6 +449,107 @@ def _global_to_local(obj, placement):
         return _copy_placement(placement)
 
 
+def _component_index(component, prefix):
+    """Return the zero-based subshape index from a hit component name."""
+
+    value = _text(component).strip()
+    marker = _text(prefix).lower()
+    start = value.lower().find(marker)
+    if start < 0:
+        return None
+
+    suffix = value[start + len(marker):]
+    digits = []
+    for character in suffix:
+        if character.isdigit():
+            digits.append(character)
+        elif digits:
+            break
+        else:
+            return None
+
+    if not digits:
+        return None
+    index = int("".join(digits)) - 1
+    return index if index >= 0 else None
+
+
+def _shape_element(obj, collection_name, index):
+    """Get a shape subelement without making hit-picking depend on topology."""
+
+    if index is None:
+        return None
+    try:
+        shape = getattr(obj, "Shape", None)
+        if shape is None:
+            return None
+        elements = list(getattr(shape, collection_name))
+        if index >= len(elements):
+            return None
+        return elements[index]
+    except Exception:
+        return None
+
+
+def _shape_point_to_global(obj, point):
+    """Convert a Shape point into world space without double-transforming it."""
+
+    try:
+        # Shape.Vertexes/Face.CenterOfMass already include the object's own
+        # Placement.  Only a containing PartDesign group still needs to be
+        # applied here (for example, a feature inside a moved Body).
+        return _parent_global_placement(obj).multVec(point)
+    except Exception:
+        return _copy_vector(point)
+
+
+def _straight_edge_midpoint(obj, edge_index):
+    """Return the world midpoint for a straight EdgeN hit."""
+
+    edge = _shape_element(obj, "Edges", edge_index)
+    if edge is None:
+        return None
+
+    try:
+        curve = edge.Curve
+        curve_name = "%s %s" % (
+            type(curve).__name__,
+            _text(getattr(curve, "TypeId", "")),
+        )
+        if "line" not in curve_name.lower():
+            return None
+
+        vertices = list(edge.Vertexes)
+        if len(vertices) < 2:
+            return None
+        first = _copy_vector(vertices[0].Point)
+        last = _copy_vector(vertices[-1].Point)
+        midpoint = App.Vector(
+            (first.x + last.x) * 0.5,
+            (first.y + last.y) * 0.5,
+            (first.z + last.z) * 0.5,
+        )
+        return _shape_point_to_global(obj, midpoint)
+    except Exception:
+        return None
+
+
+def _face_center(obj, face_index):
+    """Return a face's area-center point in world space."""
+
+    face = _shape_element(obj, "Faces", face_index)
+    if face is None:
+        return None
+
+    try:
+        center = face.CenterOfMass
+        if callable(center):
+            center = center()
+        return _shape_point_to_global(obj, center)
+    except Exception:
+        return None
+
+
 def _axis_vector(axis):
     if axis == "X":
         return App.Vector(1.0, 0.0, 0.0)
@@ -809,6 +910,22 @@ class GrabMoveSession(object):
         except Exception:
             return None
 
+    def _hit_from_record(self, record):
+        """Normalize a FreeCAD view hit into the addon's hit format."""
+
+        if not isinstance(record, dict):
+            return None
+        obj = self._object_from_record(record)
+        point = self._point_from_record(record)
+        if obj is None or point is None:
+            return None
+        return {
+            "record": record,
+            "object": obj,
+            "point": point,
+            "component": _text(record.get("Component", "")),
+        }
+
     def _objects_at(self, screen_position):
         if screen_position is None:
             return []
@@ -831,18 +948,9 @@ class GrabMoveSession(object):
 
         result = []
         for record in records:
-            if not isinstance(record, dict):
-                continue
-            obj = self._object_from_record(record)
-            point = self._point_from_record(record)
-            component = _text(record.get("Component", ""))
-            if obj is not None and point is not None:
-                result.append({
-                    "record": record,
-                    "object": obj,
-                    "point": point,
-                    "component": component,
-                })
+            hit = self._hit_from_record(record)
+            if hit is not None:
+                result.append(hit)
 
         if result:
             return result
@@ -869,18 +977,9 @@ class GrabMoveSession(object):
             return []
 
         for record in single_record:
-            if not isinstance(record, dict):
-                continue
-            obj = self._object_from_record(record)
-            point = self._point_from_record(record)
-            component = _text(record.get("Component", ""))
-            if obj is not None and point is not None:
-                result.append({
-                    "record": record,
-                    "object": obj,
-                    "point": point,
-                    "component": component,
-                })
+            hit = self._hit_from_record(record)
+            if hit is not None:
+                result.append(hit)
         return result
 
     def _object_from_record(self, record):
@@ -922,6 +1021,71 @@ class GrabMoveSession(object):
             except Exception:
                 return None
         return App.Vector(values["x"], values["y"], values["z"])
+
+    def _screen_position_for_point(self, point):
+        """Project a world point into the event coordinate system."""
+
+        try:
+            projected = self.view.getPointOnScreen(_copy_vector(point))
+            # Both getPointOnScreen() and SoEvent positions use the
+            # view's bottom-origin coordinate system.  The Y inversion is
+            # only needed when converting to a Qt QMouseEvent.
+            return float(projected[0]), float(projected[1])
+        except Exception:
+            return None
+
+    def _snap_geometry_point(self, hit):
+        """Return a synthetic center point for supported hit components."""
+
+        component = hit.get("component", "")
+        obj = hit.get("object")
+        edge_index = _component_index(component, "Edge")
+        if edge_index is not None:
+            point = _straight_edge_midpoint(obj, edge_index)
+            if point is not None:
+                return point, "Edge%d midpoint" % (edge_index + 1)
+
+        face_index = _component_index(component, "Face")
+        if face_index is not None:
+            point = _face_center(obj, face_index)
+            if point is not None:
+                return point, "Face%d center" % (face_index + 1)
+
+        return None
+
+    def _enrich_snap_hit(self, hit, sample, center, sample_index):
+        """Add search metadata and use a nearby edge/face center when found."""
+
+        dx = float(sample[0] - center[0])
+        dy = float(sample[1] - center[1])
+        sample_distance = (dx * dx + dy * dy) ** 0.5
+        enriched = dict(hit)
+        enriched["snap_screen_position"] = sample
+        enriched["snap_screen_distance"] = sample_distance
+        enriched["snap_sample_index"] = sample_index
+        enriched["snap_geometry_center"] = False
+
+        geometry_point = self._snap_geometry_point(hit)
+        if geometry_point is None:
+            return enriched
+
+        point, component = geometry_point
+        projected = self._screen_position_for_point(point)
+        if projected is None:
+            return enriched
+
+        center_dx = projected[0] - float(center[0])
+        center_dy = projected[1] - float(center[1])
+        center_distance = (center_dx * center_dx + center_dy * center_dy) ** 0.5
+        if center_distance > self.snap_radius_pixels:
+            return enriched
+
+        enriched["point"] = point
+        enriched["component"] = component
+        enriched["snap_screen_position"] = projected
+        enriched["snap_screen_distance"] = center_distance
+        enriched["snap_geometry_center"] = True
+        return enriched
 
     def _parent_group(self, obj):
         getter = getattr(obj, "getParentGeoFeatureGroup", None)
@@ -1029,21 +1193,22 @@ class GrabMoveSession(object):
             dy = float(sample[1] - center[1])
             sample_distance = (dx * dx + dy * dy) ** 0.5
             for hit in sample_hits:
-                enriched = dict(hit)
-                enriched["snap_screen_position"] = sample
-                enriched["snap_screen_distance"] = sample_distance
-                enriched["snap_sample_index"] = sample_index
+                enriched = self._enrich_snap_hit(
+                    hit, sample, center, sample_index
+                )
                 hits.append(enriched)
 
                 # Off-center face/solid hits describe a broad surface rather
                 # than a nearby snap point. Keep them for an explicit B
                 # fallback, but only use precise components for magnetic
                 # searching away from the exact cursor position.
-                if sample_distance > 0.0 and _component_priority(
-                    hit.get("component", "")
-                ) > 2:
+                if (
+                    sample_distance > 0.0
+                    and not enriched.get("snap_geometry_center", False)
+                    and _component_priority(enriched.get("component", "")) > 2
+                ):
                     continue
-                belongs = self._belongs_to_moving_object(hit["object"])
+                belongs = self._belongs_to_moving_object(enriched["object"])
                 if belongs == source:
                     candidates.append(enriched)
 

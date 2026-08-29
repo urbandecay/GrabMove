@@ -9,6 +9,8 @@ modal move command:
   hover a point on another object, and click again to align the two points.
 - Snapping searches a small magnetic radius around the cursor, prioritizes
   nearby vertices and edges, and briefly holds a target once acquired.
+- Straight edges expose a midpoint snap, and faces expose an area-center snap
+  when the cursor is near that center.
 - After the source click in `B` mode, a yellow marker stays on the selected
   source point while the target is chosen.
 - Left mouse or Enter confirms. Right mouse or Escape cancels.
