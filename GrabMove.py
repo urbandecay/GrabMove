@@ -301,6 +301,21 @@ def _constrain(delta, axis):
     return vector * delta.dot(vector)
 
 
+def _same_translation(left, right, tolerance=1.0e-7):
+    """Compare the placement translation, which is what Grab Move changes."""
+
+    try:
+        left_base = left.Base
+        right_base = right.Base
+        return all(
+            abs(float(getattr(left_base, axis)) - float(getattr(right_base, axis)))
+            <= tolerance
+            for axis in ("x", "y", "z")
+        )
+    except Exception:
+        return False
+
+
 def _event_position(event):
     position = event.get("Position") if isinstance(event, dict) else None
     if position is None:
@@ -921,6 +936,16 @@ class GrabMoveSession(object):
         elif self.phase == "snap_target":
             self._update_snap_target(position)
             if self.target_hit is not None:
+                _debug(
+                    "snap target confirmed object=%s component=%s point=(%.3f, %.3f, %.3f)"
+                    % (
+                        _object_key(self.target_hit["object"]),
+                        self.target_hit["component"] or "point",
+                        self.target_hit["point"].x,
+                        self.target_hit["point"].y,
+                        self.target_hit["point"].z,
+                    )
+                )
                 self.finish(True)
 
     def _handle_event(self, event):
@@ -993,6 +1018,16 @@ class GrabMoveSession(object):
             % (commit, self.phase, self.debug_event_count, self.debug_move_count)
         )
 
+        final_local = _copy_placement(self.obj.Placement)
+        _debug(
+            "final placement before transaction base=(%.3f, %.3f, %.3f)"
+            % (
+                final_local.Base.x,
+                final_local.Base.y,
+                final_local.Base.z,
+            )
+        )
+
         try:
             if not commit:
                 self.obj.Placement = _copy_placement(self.original_local)
@@ -1008,6 +1043,26 @@ class GrabMoveSession(object):
 
         self._remove_scene_markers()
 
+        if commit:
+            # Recompute while the transaction is still open. Some PartDesign
+            # documents can refresh a Body during recompute; preserve the
+            # final snapped Placement before committing the undo record.
+            try:
+                self.document.recompute()
+            except Exception:
+                _debug("document recompute during commit failed:\n%s" % traceback.format_exc())
+            try:
+                if not _same_translation(self.obj.Placement, final_local):
+                    _debug(
+                        "recompute changed final placement; restoring snapped placement"
+                    )
+                    self.obj.Placement = _copy_placement(final_local)
+            except Exception:
+                _debug(
+                    "could not restore final placement after recompute:\n%s"
+                    % traceback.format_exc()
+                )
+
         if self.transaction_open:
             try:
                 if commit:
@@ -1015,14 +1070,24 @@ class GrabMoveSession(object):
                 else:
                     self.document.abortTransaction()
             except Exception:
-                pass
+                _debug(
+                    "%s transaction failed:\n%s"
+                    % ("commit" if commit else "abort", traceback.format_exc())
+                )
             self.transaction_open = False
 
-        if commit:
-            try:
-                self.document.recompute()
-            except Exception:
-                pass
+        try:
+            finished_local = _copy_placement(self.obj.Placement)
+            _debug(
+                "final placement after transaction base=(%.3f, %.3f, %.3f)"
+                % (
+                    finished_local.Base.x,
+                    finished_local.Base.y,
+                    finished_local.Base.z,
+                )
+            )
+        except Exception:
+            pass
 
         if getattr(App, SESSION_ATTRIBUTE, None) is self:
             setattr(App, SESSION_ATTRIBUTE, None)
