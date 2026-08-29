@@ -5,13 +5,14 @@ modal move command:
 
 - Select one Body, ShapeBinder, or SubShapeBinder and press `G`.
 - Move the mouse, then press `X`, `Y`, or `Z` for a global-axis constraint.
-- Press `B`, click a point on the selected object, hover a point on another
-  object, and click again to align the two points.
+- Press `B`, click a source point (the selected object's geometry is preferred),
+  hover a point on another object, and click again to align the two points.
 - Left mouse or Enter confirms. Right mouse or Escape cancels.
-- If a selected Body is the source of an external ShapeBinder, the command
-  automatically moves that binder instead of breaking the cross-Body link.
+- A selected Body moves during the grab. On confirmation, its internal
+  ShapeBinders receive the same final translation before recompute, preventing
+  synchronized PartDesign features from snapping back.
 
 The addon is installed in the active FreeCAD user Mod directory. It uses
-FreeCAD's public view callbacks, `getObjectsInfo()` hit testing, and
-`Placement` updates, so the document remains a normal FreeCAD document and
-the move is one undoable transaction.
+FreeCAD's public view callbacks, `getObjectsInfo()`/`getObjectInfo()` hit
+testing, and `Placement` updates, so the document remains a normal FreeCAD
+document and the move is one undoable transaction.

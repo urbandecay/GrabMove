@@ -12,7 +12,9 @@ core.  It uses the public view event and placement APIs:
 This is intentionally a small, self-contained first implementation.  FreeCAD
 does not currently expose Blender's complete transform/snap modal operator to
 Python, so the modal state machine is implemented here and Placement remains
-the source of truth for the actual move.
+the source of truth for the actual move.  When a Body contains ShapeBinders,
+the Body moves during the grab and the Binder placements are synchronized with
+the Body's final translation immediately before recompute.
 """
 
 from __future__ import print_function
@@ -278,70 +280,67 @@ def _binder_supports_body(binder, body, body_keys):
     return False
 
 
-def _binder_for_body(body):
-    """Find an external ShapeBinder that depends on ``body``."""
+def _binders_for_body(body):
+    """Return ShapeBinders whose placements drive a Body's visible result."""
 
     if body is None or "Body" not in _text(getattr(body, "TypeId", "")):
-        return None
+        return []
 
     body_members = _group_members(body)
     body_keys = set(_object_key(member) for member in body_members)
     try:
         document_objects = list(body.Document.Objects)
     except Exception:
-        return None
+        document_objects = []
 
-    candidates = []
+    binders = []
+    for member in body_members:
+        if _is_binder_object(member):
+            binders.append(member)
+
+    # Group normally contains all features in a Body.  The parent check also
+    # covers versions/documents where a ShapeBinder is owned by the Body but
+    # is not exposed through the Group property.
     for candidate in document_objects:
         if not _is_binder_object(candidate):
             continue
-        parent = _parent_geo_feature_group(candidate)
-        if parent is not None and _same_object(parent, body):
-            # A binder inside the selected Body is local to that Body; the
-            # special redirect is only for an external tether.
+        if _object_key(candidate) in body_keys:
             continue
-        if _binder_supports_body(candidate, body, body_keys):
-            candidates.append(candidate)
+        if _same_object(_parent_geo_feature_group(candidate), body):
+            binders.append(candidate)
 
-    if not candidates:
-        return None
+    if not binders:
+        return []
 
-    visible = []
-    for candidate in candidates:
-        try:
-            if candidate.ViewObject.Visibility:
-                visible.append(candidate)
-        except Exception:
-            pass
-    selected = (visible or candidates)[0]
+    # Keep stable document order while removing any duplicate references.
+    unique = []
+    seen = set()
+    for binder in binders:
+        key = _object_key(binder)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(binder)
     _debug(
-        "tether redirect body=%s binder=%s candidates=%s"
+        "body follow target=%s binders=%s"
         % (
             _object_key(body),
-            _object_key(selected),
-            [_object_key(item) for item in candidates],
+            [_object_key(item) for item in unique],
         )
     )
-    return selected
-
-
-def _effective_moveable_object(obj):
-    if _is_binder_object(obj):
-        return obj
-    binder = _binder_for_body(obj)
-    return binder if binder is not None else obj
+    return unique
 
 
 def _resolve_moveable_object(obj):
     """Resolve a selected PartDesign feature to its owning Body.
 
     In the 3D view FreeCAD often reports the visible tip feature (for example
-    a LinearPattern) rather than the Body containing it.  Grab Move operates
+    a LinearPattern) rather than the Body containing it. Grab Move operates
     on the Body in that case, while preserving direct ShapeBinder selection.
     """
 
     if _is_moveable_object(obj):
-        return _effective_moveable_object(obj)
+        return obj
 
     current = obj
     visited = set()
@@ -354,11 +353,13 @@ def _resolve_moveable_object(obj):
         if current is None:
             break
         if _is_moveable_object(current):
-            return _effective_moveable_object(current)
+            return current
     return None
 
 
-def _selected_moveable_object():
+def _selected_object():
+    """Return the one raw object selected in the tree or 3D view."""
+
     try:
         selection = list(Gui.Selection.getSelection())
     except Exception:
@@ -366,7 +367,34 @@ def _selected_moveable_object():
 
     if len(selection) != 1:
         return None
-    return _resolve_moveable_object(selection[0])
+    return selection[0]
+
+
+def _body_for_object(obj):
+    """Return the Body that visually owns a selected feature, when known."""
+
+    if obj is None:
+        return None
+    if "Body" in _text(getattr(obj, "TypeId", "")):
+        return obj
+
+    current = obj
+    visited = set()
+    for _index in range(32):
+        key = _object_key(current)
+        if key in visited:
+            break
+        visited.add(key)
+        current = _parent_geo_feature_group(current)
+        if current is None:
+            break
+        if "Body" in _text(getattr(current, "TypeId", "")):
+            return current
+    return None
+
+
+def _selected_moveable_object():
+    return _resolve_moveable_object(_selected_object())
 
 
 def _global_placement(obj):
@@ -552,8 +580,12 @@ class _Marker(object):
 class GrabMoveSession(object):
     """One running modal move."""
 
-    def __init__(self, obj):
+    def __init__(self, obj, visual_obj=None):
         self.obj = obj
+        # Keep the selected object separate from the snap roots.  In the
+        # normal Body case these are the same object; direct Binder selection
+        # can still use its owning Body as a visual snap proxy.
+        self.visual_obj = visual_obj if visual_obj is not None else obj
         self.document = _document_for_object(obj)
         self.view = _active_view()
         self.phase = "move"
@@ -566,6 +598,22 @@ class GrabMoveSession(object):
         self.original_local = _copy_placement(obj.Placement)
         self.original_global = _global_placement(obj)
         self.preview_global = _copy_placement(self.original_global)
+
+        # A synchronized ShapeBinder can make a Body's visible result return
+        # to its old position during recompute.  Let the Body be the live
+        # target, then copy its final local translation to every Binder in the
+        # Body immediately before the commit recompute.
+        self.follow_binder_states = []
+        for binder in _binders_for_body(obj):
+            try:
+                self.follow_binder_states.append(
+                    (binder, _copy_placement(binder.Placement))
+                )
+            except Exception:
+                _debug(
+                    "could not snapshot body-follow Binder=%s"
+                    % (_object_key(binder),)
+                )
 
         self.initial_cursor_world = None
         self.last_screen_position = None
@@ -592,6 +640,11 @@ class GrabMoveSession(object):
                 type(self.view).__name__ if self.view is not None else "None",
             )
         )
+        if not _same_object(self.visual_obj, self.obj):
+            _debug(
+                "visual grab proxy=%s actual move target=%s"
+                % (_object_key(self.visual_obj), _object_key(self.obj))
+            )
 
     def start(self):
         if self.view is None:
@@ -707,16 +760,15 @@ class GrabMoveSession(object):
         if screen_position is None:
             return []
 
+        position = (int(screen_position[0]), int(screen_position[1]))
         try:
-            records = self.view.getObjectsInfo(
-                (int(screen_position[0]), int(screen_position[1]))
-            )
+            records = self.view.getObjectsInfo(position)
         except Exception:
-            return []
+            records = None
 
         if records is None:
-            return []
-        if isinstance(records, dict):
+            records = []
+        elif isinstance(records, dict):
             records = [records]
 
         try:
@@ -726,6 +778,44 @@ class GrabMoveSession(object):
 
         result = []
         for record in records:
+            if not isinstance(record, dict):
+                continue
+            obj = self._object_from_record(record)
+            point = self._point_from_record(record)
+            component = _text(record.get("Component", ""))
+            if obj is not None and point is not None:
+                result.append({
+                    "record": record,
+                    "object": obj,
+                    "point": point,
+                    "component": component,
+                })
+
+        if result:
+            return result
+
+        # Some FreeCAD builds/views return no usable list from
+        # getObjectsInfo() even though the single-hit API can identify the
+        # point under the cursor.  The two APIs use the same record format.
+        single_record = None
+        for args in ((position,), position):
+            try:
+                single_record = self.view.getObjectInfo(*args)
+            except Exception:
+                continue
+            if single_record is not None:
+                break
+
+        if single_record is None:
+            return []
+        if isinstance(single_record, dict):
+            single_record = [single_record]
+        try:
+            single_record = list(single_record)
+        except Exception:
+            return []
+
+        for record in single_record:
             if not isinstance(record, dict):
                 continue
             obj = self._object_from_record(record)
@@ -792,42 +882,59 @@ class GrabMoveSession(object):
     def _belongs_to_moving_object(self, obj):
         if obj is None:
             return False
-        if _same_object(obj, self.obj):
-            return True
 
-        current = obj
-        visited = set()
-        for _index in range(32):
-            key = _object_key(current)
-            if key in visited:
-                break
-            visited.add(key)
-            parent = self._parent_group(current)
-            if parent is None:
-                break
-            if _same_object(parent, self.obj):
-                return True
-            current = parent
+        # Snapping should recognize both the actual Placement target and the
+        # object the user thinks they grabbed.  The latter is normally the
+        # selected Body when a binder is being moved on its behalf.
+        roots = [self.obj]
+        if not _same_object(self.visual_obj, self.obj):
+            roots.append(self.visual_obj)
 
-        # Some older PartDesign objects expose the Body relationship through
-        # Group but not getParentGeoFeatureGroup.
-        try:
-            pending = list(getattr(self.obj, "Group", []) or [])
-        except Exception:
-            pending = []
-        visited = set()
-        while pending:
-            candidate = pending.pop()
-            key = _object_key(candidate)
-            if key in visited:
-                continue
-            visited.add(key)
-            if _same_object(candidate, obj):
+        for root in roots:
+            if _same_object(obj, root):
                 return True
+
+            # A view hit may report a visible PartDesign tip or link whose
+            # parent chain is not exposed consistently by every FreeCAD
+            # version.  Resolve its owning Body before falling back to Group
+            # traversal.
+            owner = _body_for_object(obj)
+            if owner is not None and _same_object(owner, root):
+                return True
+
+            current = obj
+            visited = set()
+            for _index in range(32):
+                key = _object_key(current)
+                if key in visited:
+                    break
+                visited.add(key)
+                parent = self._parent_group(current)
+                if parent is None:
+                    break
+                if _same_object(parent, root):
+                    return True
+                current = parent
+
+            # Some older PartDesign objects expose the Body relationship
+            # through Group but not getParentGeoFeatureGroup.
             try:
-                pending.extend(list(getattr(candidate, "Group", []) or []))
+                pending = list(getattr(root, "Group", []) or [])
             except Exception:
-                pass
+                pending = []
+            visited = set()
+            while pending:
+                candidate = pending.pop()
+                key = _object_key(candidate)
+                if key in visited:
+                    continue
+                visited.add(key)
+                if _same_object(candidate, obj):
+                    return True
+                try:
+                    pending.extend(list(getattr(candidate, "Group", []) or []))
+                except Exception:
+                    pass
         return False
 
     def _pick_snap_hit(self, screen_position, source):
@@ -839,6 +946,21 @@ class GrabMoveSession(object):
             belongs = self._belongs_to_moving_object(hit["object"])
             if belongs == source:
                 candidates.append(hit)
+
+        # B is an explicit request to choose a source point.  If FreeCAD's
+        # hit record does not expose the selected Body's ownership (common for
+        # linked/tip display paths), keep the frontmost visible point instead
+        # of rejecting the click outright.  The normal ownership match above
+        # always wins when available.
+        if source and not candidates and hits:
+            candidates = [hits[0]]
+            _debug(
+                "snap source ownership fallback object=%s component=%s"
+                % (
+                    _object_key(hits[0]["object"]),
+                    hits[0]["component"] or "point",
+                )
+            )
 
         self.debug_snap_query_count += 1
         if not candidates:
@@ -893,6 +1015,46 @@ class GrabMoveSession(object):
                     desired.Base.x, desired.Base.y, desired.Base.z,
                 )
             )
+
+    def _sync_body_binders(self, final_local):
+        """Make internal ShapeBinders follow the Body's committed translation."""
+
+        if not self.follow_binder_states:
+            return
+
+        body_delta = (
+            _copy_vector(final_local.Base) - _copy_vector(self.original_local.Base)
+        )
+        _debug(
+            "body follow delta=(%.3f, %.3f, %.3f) binders=%s"
+            % (
+                body_delta.x,
+                body_delta.y,
+                body_delta.z,
+                [_object_key(item[0]) for item in self.follow_binder_states],
+            )
+        )
+
+        for binder, original in self.follow_binder_states:
+            desired = _copy_placement(original)
+            desired.Base = _copy_vector(original.Base) + body_delta
+            try:
+                binder.Placement = desired
+                _debug(
+                    "body follow applied binder=%s base=(%.3f, %.3f, %.3f)"
+                    % (
+                        _object_key(binder),
+                        desired.Base.x,
+                        desired.Base.y,
+                        desired.Base.z,
+                    )
+                )
+            except Exception:
+                _debug(
+                    "body follow failed binder=%s:\n%s"
+                    % (_object_key(binder), traceback.format_exc())
+                )
+
     def _update_move(self, screen_position):
         world = self._view_point(screen_position)
         if world is None:
@@ -1166,6 +1328,10 @@ class GrabMoveSession(object):
         self._remove_scene_markers()
 
         if commit:
+            # Apply the Body's final translation to its internal synchronized
+            # Binders before recompute, so the PartDesign result does not
+            # resolve back to the pre-grab location.
+            self._sync_body_binders(final_local)
             # Recompute while the transaction is still open. Some PartDesign
             # documents can refresh a Body during recompute; preserve the
             # final snapped Placement before committing the undo record.
@@ -1242,7 +1408,8 @@ class GrabMoveCommand(object):
             _debug("command ignored: another session is active")
             return
 
-        obj = _selected_moveable_object()
+        selected_obj = _selected_object()
+        obj = _resolve_moveable_object(selected_obj)
         if obj is None:
             try:
                 selection = list(Gui.Selection.getSelection())
@@ -1260,7 +1427,8 @@ class GrabMoveCommand(object):
             )
             return
 
-        session = GrabMoveSession(obj)
+        visual_obj = _body_for_object(selected_obj) or selected_obj
+        session = GrabMoveSession(obj, visual_obj=visual_obj)
         setattr(App, SESSION_ATTRIBUTE, session)
         _debug("session stored on App as %s" % SESSION_ATTRIBUTE)
         try:
