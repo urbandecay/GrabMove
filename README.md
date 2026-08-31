@@ -24,26 +24,7 @@ modal move command:
   ShapeBinders receive the same final translation before recompute, preventing
   synchronized PartDesign features from snapping back.
 
-When a PartDesign Linear Pattern task dialog is open, the addon also adds
-`Grab preview with mouse`. Check it to display orange preview occurrence
-handles. Click an occurrence handle and drag it along the pattern direction;
-the Linear Pattern Length (Extent mode) or Offset (Spacing mode) is updated
-live. While dragging, hovering over another body's vertex or edge midpoint
-magnetically snaps the grabbed preview point to that target while preserving
-the pattern's one-dimensional motion. Right-click cancels the current preview
-drag, and the task's normal Cancel button cancels the whole edit.
-
-The preview-drag control is intentionally limited to uniform first-direction
-linear patterns. Non-uniform spacing patterns are left to FreeCAD's normal
-controls. If Length or Offset is driven by an expression, the first successful
-preview move replaces that field with the numeric value, just like an explicit
-manual edit; cancelling the task restores the expression.
-
 The addon is installed in the active FreeCAD user Mod directory. It uses
 FreeCAD's public view callbacks, `getObjectsInfo()`/`getObjectInfo()` hit
 testing, and `Placement` updates, so the document remains a normal FreeCAD
 document and the move is one undoable transaction.
-
-The repository also includes the companion `HoverSelect` addon. It selects the
-Body under the cursor with `L`, appends additional Bodies on later `L` presses,
-and expands/scrolls the tree to show the selected Bodies.
