@@ -2920,6 +2920,7 @@ class LinearPatternPreviewGrabController(object):
     # mouse-event path so a dense model cannot starve FreeCAD's Qt event loop.
     POLL_INTERVAL_MS = 300
     RECOMPUTE_INTERVAL_MS = 120
+    DRAG_UPDATE_INTERVAL_MS = 20
     HANDLE_RADIUS_PIXELS = 32.0
 
     def __init__(self, main):
@@ -2950,6 +2951,12 @@ class LinearPatternPreviewGrabController(object):
         self._preview_dirty = False
         self._last_pointer_position = None
         self._preview_session = None
+        self._snap_picker = None
+        self._snap_source_world = None
+        self._snap_source_scalar = None
+        self._snap_source_local_scalar = 0.0
+        self._snap_target_hit = None
+        self._pending_drag_position = None
         self._closed = False
 
         self._poll_timer = self._QtCore.QTimer(main)
@@ -2961,6 +2968,15 @@ class LinearPatternPreviewGrabController(object):
         self._recompute_timer.setSingleShot(True)
         self._recompute_timer.setInterval(self.RECOMPUTE_INTERVAL_MS)
         self._recompute_timer.timeout.connect(self._recompute_preview)
+
+        # Coin invokes the viewport callbacks while it is traversing the
+        # scene. FreeCAD picking and preview recompute are not safe from that
+        # callback, so mouse motion only queues a position here; all picking,
+        # parameter changes, and redraws happen after Coin returns to Qt.
+        self._drag_update_timer = self._QtCore.QTimer(main)
+        self._drag_update_timer.setSingleShot(True)
+        self._drag_update_timer.setInterval(self.DRAG_UPDATE_INTERVAL_MS)
+        self._drag_update_timer.timeout.connect(self._process_pending_drag)
         self._poll()
 
     # ---- task-panel discovery -----------------------------------------
@@ -3940,6 +3956,143 @@ class LinearPatternPreviewGrabController(object):
         except Exception:
             return False
 
+    def _clear_snap_picker(self):
+        picker = self._snap_picker
+        self._snap_picker = None
+        self._snap_source_world = None
+        self._snap_source_scalar = None
+        self._snap_source_local_scalar = 0.0
+        self._snap_target_hit = None
+        if picker is None:
+            return
+        try:
+            picker._remove_scene_markers()
+        except Exception:
+            pass
+
+    def _prepare_snap_picker(self, position, data, index, scalar):
+        self._clear_snap_picker()
+        try:
+            # Do not call getObjectsInfo() or modify the scene from the Coin
+            # mouse callback. The target picker is created lazily by the Qt
+            # timer after Coin has returned to the application event loop.
+            source_world = data["start"] + data["direction"] * float(scalar)
+
+            occurrence_scalar = (
+                data["points"][index] - data["start"]
+            ).dot(data["direction"])
+            source_scalar = (
+                source_world - data["start"]
+            ).dot(data["direction"])
+            self._snap_source_world = source_world
+            self._snap_source_scalar = source_scalar
+            self._snap_source_local_scalar = (
+                source_scalar - occurrence_scalar
+            )
+        except Exception:
+            self._clear_snap_picker()
+            _debug(
+                "Linear Pattern snap picker setup failed:\n%s"
+                % traceback.format_exc()
+            )
+
+    def _property_value_for_occurrence(self, data, index, scalar):
+        scalar = max(0.001, float(scalar))
+        if _text(data["property_name"]).lower() == "offset":
+            return scalar / float(index)
+        return scalar * (
+            float(data["occurrences"] - 1) / float(index)
+        )
+
+    def _update_snap_source_marker(self, data, property_value):
+        picker = self._snap_picker
+        if picker is None or self._snap_source_world is None:
+            return
+        try:
+            current_data = self._pattern_data_at_value(data, property_value)
+            current_scalar = (
+                current_data["points"][self._drag_index]
+                - current_data["start"]
+            ).dot(current_data["direction"])
+            initial_scalar = (
+                data["points"][self._drag_index] - data["start"]
+            ).dot(data["direction"])
+            picker.source_marker.set_point(
+                self._snap_source_world
+                + data["direction"] * (current_scalar - initial_scalar)
+            )
+        except Exception:
+            pass
+
+    def _apply_snap_target(self, position):
+        data = self._drag_data or self._pattern_data()
+        index = self._drag_index
+        picker = self._snap_picker
+        if picker is None and data is not None:
+            try:
+                # This runs from the Qt timer, never from a Coin callback.
+                picker = LinearPatternPreviewGrabSession(self, data)
+                self._snap_picker = picker
+            except Exception:
+                _debug(
+                    "Linear Pattern snap picker creation failed:\n%s"
+                    % traceback.format_exc()
+                )
+                picker = None
+        if (
+            picker is None
+            or data is None
+            or index is None
+            or self._snap_source_world is None
+            or self._snap_source_scalar is None
+        ):
+            return False
+
+        try:
+            target = picker._pick_target(position)
+        except Exception:
+            _debug(
+                "Linear Pattern snap target query failed:\n%s"
+                % traceback.format_exc()
+            )
+            target = None
+
+        if target is None:
+            picker.target_marker.hide()
+            self._snap_target_hit = None
+            return False
+
+        target_point = target.get("point")
+        if target_point is None:
+            picker.target_marker.hide()
+            self._snap_target_hit = None
+            return False
+
+        desired_source_scalar = self._snap_source_scalar + (
+            _copy_vector(target_point) - self._snap_source_world
+        ).dot(data["direction"])
+        desired_occurrence_scalar = (
+            desired_source_scalar - self._snap_source_local_scalar
+        )
+        property_value = self._property_value_for_occurrence(
+            data, index, desired_occurrence_scalar
+        )
+        if not self._set_parameter(data["property_name"], property_value):
+            return False
+
+        self._snap_target_hit = target
+        picker.target_hit = target
+        picker.target_marker.set_point(target_point)
+        self._last_scalar = desired_occurrence_scalar + float(self._drag_offset)
+        self._schedule_recompute()
+        self._update_overlay(
+            self._pattern_data_at_value(data, property_value), redraw=False
+        )
+        self._update_snap_source_marker(data, property_value)
+        component = target.get("component") or "point"
+        self._status("Preview drag snapped to %s" % component)
+        return True
+
     def _apply_drag(self, position):
         # The occurrence geometry and direction do not change during one
         # drag.  Reusing the click-time data avoids rebuilding the source
@@ -3959,12 +4112,9 @@ class LinearPatternPreviewGrabController(object):
         self._last_scalar = scalar
         desired_occurrence = float(scalar) - float(self._drag_offset)
         desired_occurrence = max(0.001, desired_occurrence)
-        if _text(data["property_name"]).lower() == "offset":
-            property_value = desired_occurrence / float(index)
-        else:
-            property_value = desired_occurrence * (
-                float(data["occurrences"] - 1) / float(index)
-            )
+        property_value = self._property_value_for_occurrence(
+            data, index, desired_occurrence
+        )
         if self._set_parameter(data["property_name"], property_value):
             self._last_cursor = position
             self._schedule_recompute()
@@ -3972,6 +4122,48 @@ class LinearPatternPreviewGrabController(object):
                 self._pattern_data_at_value(data, property_value),
                 redraw=False,
             )
+            self._update_snap_source_marker(data, property_value)
+
+    def _queue_drag_update(self, position):
+        """Queue one drag position for processing after Coin returns."""
+
+        self._pending_drag_position = position
+        try:
+            if not self._drag_update_timer.isActive():
+                self._drag_update_timer.start()
+        except Exception:
+            # The timer exists in the GUI path. If a stripped-down test or
+            # startup path has no timer, leave the position queued rather than
+            # re-entering FreeCAD from the Coin callback.
+            pass
+
+    def _process_pending_drag(self):
+        position = self._pending_drag_position
+        self._pending_drag_position = None
+        if not self._dragging or position is None:
+            return
+        try:
+            if not self._apply_snap_target(position):
+                self._apply_drag(position)
+        except Exception:
+            _debug(
+                "Linear Pattern deferred drag update failed:\n%s"
+                % traceback.format_exc()
+            )
+        if self._dragging and self._pending_drag_position is not None:
+            try:
+                if not self._drag_update_timer.isActive():
+                    self._drag_update_timer.start()
+            except Exception:
+                pass
+
+    def _finish_preview_drag_cleanup(self):
+        """Refresh the overlay after Coin has finished the mouse event."""
+
+        try:
+            self._update_overlay(self._pattern_data())
+        except Exception:
+            pass
 
     def _on_location(self, event_callback):
         try:
@@ -3981,7 +4173,7 @@ class LinearPatternPreviewGrabController(object):
                 return
             self._last_pointer_position = position
             if self._dragging:
-                self._apply_drag(position)
+                self._queue_drag_update(position)
         except Exception:
             _debug(
                 "Linear Pattern preview drag motion failed:\n%s"
@@ -4020,7 +4212,18 @@ class LinearPatternPreviewGrabController(object):
                     self._drag_data = None
                     self._drag_offset = 0.0
                     self._drag_snapshot = None
-                    self._update_overlay(self._pattern_data())
+                    self._clear_snap_picker()
+                    self._pending_drag_position = None
+                    try:
+                        self._drag_update_timer.stop()
+                    except Exception:
+                        pass
+                    try:
+                        self._QtCore.QTimer.singleShot(
+                            0, self._finish_preview_drag_cleanup
+                        )
+                    except Exception:
+                        pass
                     _debug("Linear Pattern preview drag finished")
                 return
 
@@ -4028,15 +4231,18 @@ class LinearPatternPreviewGrabController(object):
                 return
 
             if self._dragging:
-                self._apply_drag(position)
+                self._queue_drag_update(position)
                 return
 
             data = self._pattern_data()
-            index = self._hit_occurrence(position, data) if data else None
+            # Keep all FreeCAD view picking out of the Coin mouse callback.
+            # The visible orange/red occurrence marker is enough to arm the
+            # drag; target-body picking is deferred to the Qt timer.
+            index = self._nearest_occurrence(position, data) if data else None
             if data is None or index is None or index <= 0:
                 return
 
-            scalar = self._cursor_scalar(position, data, include_scene_hit=True)
+            scalar = self._cursor_scalar(position, data, include_scene_hit=False)
             if scalar is None:
                 return
 
@@ -4051,10 +4257,11 @@ class LinearPatternPreviewGrabController(object):
             self._drag_snapshot = self._snapshot_parameters()
             self._last_cursor = position
             self._last_scalar = scalar
+            self._prepare_snap_picker(position, data, index, scalar)
             _debug(
                 "Linear Pattern preview drag started occurrence=%d" % index
             )
-            self._apply_drag(position)
+            self._queue_drag_update(position)
         except Exception:
             _debug(
                 "Linear Pattern preview mouse handling failed:\n%s"
@@ -4063,6 +4270,12 @@ class LinearPatternPreviewGrabController(object):
 
     def _cancel_drag(self, restore=False):
         snapshot = self._drag_snapshot if restore else None
+        self._clear_snap_picker()
+        self._pending_drag_position = None
+        try:
+            self._drag_update_timer.stop()
+        except Exception:
+            pass
         self._dragging = False
         self._drag_index = None
         self._drag_data = None
@@ -4326,6 +4539,11 @@ class LinearPatternPreviewGrabController(object):
         try:
             self._recompute_timer.stop()
             self._recompute_timer.deleteLater()
+        except Exception:
+            pass
+        try:
+            self._drag_update_timer.stop()
+            self._drag_update_timer.deleteLater()
         except Exception:
             pass
         self._detach_task()

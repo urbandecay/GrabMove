@@ -28,8 +28,10 @@ When a PartDesign Linear Pattern task dialog is open, the addon also adds
 `Grab preview with mouse`. Check it to display orange preview occurrence
 handles. Click an occurrence handle and drag it along the pattern direction;
 the Linear Pattern Length (Extent mode) or Offset (Spacing mode) is updated
-live. Right-click cancels the current preview drag, and the task's normal
-Cancel button cancels the whole edit.
+live. While dragging, hovering over another body's vertex or edge midpoint
+magnetically snaps the grabbed preview point to that target while preserving
+the pattern's one-dimensional motion. Right-click cancels the current preview
+drag, and the task's normal Cancel button cancels the whole edit.
 
 The preview-drag control is intentionally limited to uniform first-direction
 linear patterns. Non-uniform spacing patterns are left to FreeCAD's normal
