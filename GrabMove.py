@@ -3,7 +3,7 @@
 The command deliberately lives in Python rather than changing FreeCAD's
 core.  It uses the public view event and placement APIs:
 
-* ``G`` starts a modal translation.
+* ``G`` starts a modal translation for every selected moveable object.
 * ``X``, ``Y`` or ``Z`` constrains the translation to a global axis.
 * Type a numeric distance after an axis to enter an exact displacement;
   Backspace edits it and the live X/Y/Z displacement HUD stays visible.
@@ -15,9 +15,10 @@ core.  It uses the public view event and placement APIs:
 This is intentionally a small, self-contained first implementation.  FreeCAD
 does not currently expose Blender's complete transform/snap modal operator to
 Python, so the modal state machine is implemented here and Placement remains
-the source of truth for the actual move.  When a Body contains ShapeBinders,
-the Body moves during the grab and the Binder placements are synchronized with
-the Body's final translation immediately before recompute.
+the source of truth for the actual move.  Selected objects receive one shared
+world-space translation.  When a Body contains ShapeBinders, the Body moves
+during the grab and the Binder placements are synchronized with the Body's
+final translation immediately before recompute.
 """
 
 from __future__ import print_function
@@ -397,14 +398,19 @@ def _resolve_moveable_object(obj):
     return None
 
 
+def _selected_objects():
+    """Return the raw objects currently selected in FreeCAD."""
+
+    try:
+        return list(Gui.Selection.getSelection())
+    except Exception:
+        return []
+
+
 def _selected_object():
     """Return the one raw object selected in the tree or 3D view."""
 
-    try:
-        selection = list(Gui.Selection.getSelection())
-    except Exception:
-        return None
-
+    selection = _selected_objects()
     if len(selection) != 1:
         return None
     return selection[0]
@@ -434,7 +440,39 @@ def _body_for_object(obj):
 
 
 def _selected_moveable_object():
-    return _resolve_moveable_object(_selected_object())
+    objects = _selected_moveable_objects()
+    if len(objects) != 1:
+        return None
+    return objects[0]
+
+
+def _selected_moveable_items():
+    """Return unique move targets and their visual snap proxies.
+
+    HoverSelect keeps the normal selection Body-only, but resolving every raw
+    selection here also makes Grab Move work when a Body's visible Tip or a
+    ShapeBinder was selected through the tree or another FreeCAD command.
+    """
+
+    items = []
+    seen = set()
+    for selected_obj in _selected_objects():
+        obj = _resolve_moveable_object(selected_obj)
+        if obj is None:
+            continue
+        key = _object_key(obj)
+        if key in seen:
+            continue
+        seen.add(key)
+        visual_obj = _body_for_object(selected_obj) or selected_obj
+        items.append((obj, visual_obj))
+    return items
+
+
+def _selected_moveable_objects():
+    """Return all unique moveable objects in the current FreeCAD selection."""
+
+    return [item[0] for item in _selected_moveable_items()]
 
 
 def _global_placement(obj):
@@ -744,15 +782,75 @@ class _Marker(object):
 
 
 class GrabMoveSession(object):
-    """One running modal move."""
+    """One running modal move for one or more selected objects."""
 
-    def __init__(self, obj, visual_obj=None):
-        self.obj = obj
-        # Keep the selected object separate from the snap roots.  In the
-        # normal Body case these are the same object; direct Binder selection
-        # can still use its owning Body as a visual snap proxy.
-        self.visual_obj = visual_obj if visual_obj is not None else obj
-        self.document = _document_for_object(obj)
+    def __init__(self, obj, visual_obj=None, visual_objects=None):
+        if isinstance(obj, (list, tuple)):
+            moveable_objects = list(obj)
+        else:
+            moveable_objects = [obj]
+        if not moveable_objects:
+            raise ValueError("Grab Move requires at least one moveable object")
+
+        if visual_objects is not None:
+            snap_proxies = list(visual_objects)
+        elif isinstance(visual_obj, (list, tuple)):
+            snap_proxies = list(visual_obj)
+        elif visual_obj is not None:
+            snap_proxies = [visual_obj]
+        else:
+            snap_proxies = list(moveable_objects)
+
+        self.target_states = []
+        seen_targets = set()
+        for index, target in enumerate(moveable_objects):
+            key = _object_key(target)
+            if key in seen_targets:
+                continue
+            seen_targets.add(key)
+            proxy = (
+                snap_proxies[index]
+                if index < len(snap_proxies) and snap_proxies[index] is not None
+                else target
+            )
+            original_local = _copy_placement(target.Placement)
+            original_global = _global_placement(target)
+            follow_binder_states = []
+            for binder in _binders_for_body(target):
+                try:
+                    follow_binder_states.append(
+                        (binder, _copy_placement(binder.Placement))
+                    )
+                except Exception:
+                    _debug(
+                        "could not snapshot body-follow Binder=%s"
+                        % (_object_key(binder),)
+                    )
+            self.target_states.append(
+                {
+                    "obj": target,
+                    "visual_obj": proxy,
+                    "original_local": original_local,
+                    "original_global": original_global,
+                    "preview_global": _copy_placement(original_global),
+                    "follow_binder_states": follow_binder_states,
+                }
+            )
+
+        if not self.target_states:
+            raise ValueError("Grab Move requires at least one moveable object")
+
+        # Keep the primary-object attributes for the HUD and existing snap
+        # calculations.  The target_states list is the source of truth for
+        # applying and restoring the shared translation.
+        primary = self.target_states[0]
+        self.obj = primary["obj"]
+        self.visual_obj = primary["visual_obj"]
+        self.move_objects = [state["obj"] for state in self.target_states]
+        self.visual_objects = [
+            state["visual_obj"] for state in self.target_states
+        ]
+        self.document = _document_for_object(self.obj)
         self.view = _active_view()
         self.phase = "move"
         self.axis = None
@@ -761,25 +859,13 @@ class GrabMoveSession(object):
         self.pending_commit = None
         self.cleanup_done = False
 
-        self.original_local = _copy_placement(obj.Placement)
-        self.original_global = _global_placement(obj)
+        self.original_local = primary["original_local"]
+        self.original_global = primary["original_global"]
+        self.original_globals = [
+            state["original_global"] for state in self.target_states
+        ]
         self.preview_global = _copy_placement(self.original_global)
-
-        # A synchronized ShapeBinder can make a Body's visible result return
-        # to its old position during recompute.  Let the Body be the live
-        # target, then copy its final local translation to every Binder in the
-        # Body immediately before the commit recompute.
-        self.follow_binder_states = []
-        for binder in _binders_for_body(obj):
-            try:
-                self.follow_binder_states.append(
-                    (binder, _copy_placement(binder.Placement))
-                )
-            except Exception:
-                _debug(
-                    "could not snapshot body-follow Binder=%s"
-                    % (_object_key(binder),)
-                )
+        self.follow_binder_states = primary["follow_binder_states"]
 
         self.initial_cursor_world = None
         self.last_screen_position = None
@@ -797,6 +883,7 @@ class GrabMoveSession(object):
         self.hud_viewport = None
 
         self.snap_baseline_global = None
+        self.snap_baseline_placements = None
         self.source_world = None
         self.source_local = None
         self.source_hit = None
@@ -815,10 +902,13 @@ class GrabMoveSession(object):
         self.source_marker = _Marker((1.0, 0.75, 0.1))
         self.target_marker = _Marker((0.1, 0.9, 1.0))
         _debug(
-            "session created for %s type=%s view=%s"
+            "session created for targets=%s view=%s"
             % (
-                _object_key(obj),
-                _text(getattr(obj, "TypeId", "")),
+                [
+                    (_object_key(state["obj"]),
+                     _text(getattr(state["obj"], "TypeId", "")))
+                    for state in self.target_states
+                ],
                 type(self.view).__name__ if self.view is not None else "None",
             )
         )
@@ -867,8 +957,13 @@ class GrabMoveSession(object):
         self._focus_view()
         _debug("view focus requested")
         self._status(
-            "Grab Move: move mouse | X/Y/Z constrain | B pick snap source | "
+            "Grab Move: moving %d object%s | move mouse | X/Y/Z constrain | "
+            "B pick snap source | "
             "LMB/Enter accept | RMB/Esc cancel"
+            % (
+                len(self.target_states),
+                "" if len(self.target_states) == 1 else "s",
+            )
         )
 
     def _focus_view(self):
@@ -1228,10 +1323,16 @@ class GrabMoveSession(object):
 
         delta = _axis_vector(self.axis) * float(self.numeric_value)
         if self.phase == "move":
-            self._apply_global_translation(self.original_global, delta)
+            self._apply_global_translation(
+                self.original_global, delta, self.original_globals
+            )
             return True
         if self.phase == "snap_target" and self.snap_baseline_global is not None:
-            self._apply_global_translation(self.snap_baseline_global, delta)
+            self._apply_global_translation(
+                self.snap_baseline_global,
+                delta,
+                self.snap_baseline_placements,
+            )
             self._update_source_marker()
             return True
         return False
@@ -1246,11 +1347,15 @@ class GrabMoveSession(object):
             self._update_snap_target(self.last_screen_position)
         elif self.phase == "move":
             self._apply_global_translation(
-                self.original_global, App.Vector(0.0, 0.0, 0.0)
+                self.original_global,
+                App.Vector(0.0, 0.0, 0.0),
+                self.original_globals,
             )
         elif self.phase == "snap_target" and self.snap_baseline_global is not None:
             self._apply_global_translation(
-                self.snap_baseline_global, App.Vector(0.0, 0.0, 0.0)
+                self.snap_baseline_global,
+                App.Vector(0.0, 0.0, 0.0),
+                self.snap_baseline_placements,
             )
             self._update_source_marker()
         else:
@@ -1521,9 +1626,10 @@ class GrabMoveSession(object):
         # Snapping should recognize both the actual Placement target and the
         # object the user thinks they grabbed.  The latter is normally the
         # selected Body when a binder is being moved on its behalf.
-        roots = [self.obj]
-        if not _same_object(self.visual_obj, self.obj):
-            roots.append(self.visual_obj)
+        roots = []
+        for root in self.move_objects + self.visual_objects:
+            if not any(_same_object(root, existing) for existing in roots):
+                roots.append(root)
 
         for root in roots:
             if _same_object(obj, root):
@@ -1687,16 +1793,38 @@ class GrabMoveSession(object):
     def _pick_target(self, screen_position):
         return self._pick_snap_hit(screen_position, False)
 
-    def _apply_global_translation(self, baseline, delta):
-        desired = _copy_placement(baseline)
-        desired.Base = _copy_vector(baseline.Base) + _copy_vector(delta)
-        local = _global_to_local(self.obj, desired)
-        try:
-            self.obj.Placement = local
-        except Exception:
-            raise RuntimeError("The selected object has a read-only Placement")
+    def _apply_global_translation(self, baseline, delta, baselines=None):
+        """Apply one world-space translation to every selected target."""
 
-        self.preview_global = desired
+        if baselines is None:
+            baselines = self.original_globals
+
+        desired_primary = None
+        for index, state in enumerate(self.target_states):
+            target_baseline = (
+                baselines[index]
+                if index < len(baselines)
+                else baseline
+            )
+            desired = _copy_placement(target_baseline)
+            desired.Base = (
+                _copy_vector(target_baseline.Base) + _copy_vector(delta)
+            )
+            target = state["obj"]
+            local = _global_to_local(target, desired)
+            try:
+                target.Placement = local
+            except Exception:
+                raise RuntimeError(
+                    "A selected object has a read-only Placement"
+                )
+
+            state["preview_global"] = desired
+            if index == 0:
+                desired_primary = desired
+
+        if desired_primary is not None:
+            self.preview_global = desired_primary
         self._update_hud()
         self.debug_move_count += 1
         if self.debug_move_count <= 3 or self.debug_move_count % 25 == 0:
@@ -1712,23 +1840,36 @@ class GrabMoveSession(object):
     def _update_source_marker(self):
         """Keep the yellow source marker attached to the moving object."""
 
-        if self.source_local is None:
+        if self.source_world is None:
             return
 
         try:
-            current_source = self.preview_global.multVec(self.source_local)
+            if self.snap_baseline_global is not None:
+                translation = (
+                    _copy_vector(self.preview_global.Base)
+                    - _copy_vector(self.snap_baseline_global.Base)
+                )
+                current_source = _copy_vector(self.source_world) + translation
+            elif self.source_local is not None:
+                current_source = self.preview_global.multVec(self.source_local)
+            else:
+                return
             self.source_marker.set_point(current_source)
         except Exception:
             _debug("source marker update failed:\n%s" % traceback.format_exc())
 
-    def _sync_body_binders(self, final_local):
+    def _sync_body_binders(self, final_local, target_state=None):
         """Make internal ShapeBinders follow the Body's committed translation."""
 
-        if not self.follow_binder_states:
+        if target_state is None:
+            target_state = self.target_states[0]
+        follow_binder_states = target_state["follow_binder_states"]
+        if not follow_binder_states:
             return
 
         body_delta = (
-            _copy_vector(final_local.Base) - _copy_vector(self.original_local.Base)
+            _copy_vector(final_local.Base)
+            - _copy_vector(target_state["original_local"].Base)
         )
         _debug(
             "body follow delta=(%.3f, %.3f, %.3f) binders=%s"
@@ -1736,11 +1877,11 @@ class GrabMoveSession(object):
                 body_delta.x,
                 body_delta.y,
                 body_delta.z,
-                [_object_key(item[0]) for item in self.follow_binder_states],
+                [_object_key(item[0]) for item in follow_binder_states],
             )
         )
 
-        for binder, original in self.follow_binder_states:
+        for binder, original in follow_binder_states:
             desired = _copy_placement(original)
             desired.Base = _copy_vector(original.Base) + body_delta
             try:
@@ -1771,7 +1912,9 @@ class GrabMoveSession(object):
 
         delta = world - self.initial_cursor_world
         self._apply_global_translation(
-            self.original_global, self._delta_with_numeric(delta)
+            self.original_global,
+            self._delta_with_numeric(delta),
+            self.original_globals,
         )
 
     def _update_source_hover(self, screen_position):
@@ -1779,7 +1922,7 @@ class GrabMoveSession(object):
         if hit is None:
             self.source_marker.hide()
             self._status(
-                "Grab Move: B mode — hover a point on the selected Body/ShapeBinder"
+                "Grab Move: B mode — hover a point on selected geometry"
             )
             return
 
@@ -1801,6 +1944,10 @@ class GrabMoveSession(object):
 
         self.source_hit = hit
         self.source_world = _copy_vector(hit["point"])
+        self.snap_baseline_placements = [
+            _copy_placement(state["preview_global"])
+            for state in self.target_states
+        ]
         self.snap_baseline_global = _copy_placement(self.preview_global)
         try:
             self.source_local = self.snap_baseline_global.inverse().multVec(
@@ -1857,7 +2004,9 @@ class GrabMoveSession(object):
             )
 
         self._apply_global_translation(
-            self.snap_baseline_global, self._delta_with_numeric(delta)
+            self.snap_baseline_global,
+            self._delta_with_numeric(delta),
+            self.snap_baseline_placements,
         )
         self._update_source_marker()
 
@@ -1899,13 +2048,17 @@ class GrabMoveSession(object):
         if key == "B" and self.phase == "move":
             self.phase = "pick_source"
             self._reset_numeric_input()
+            self.snap_baseline_placements = [
+                _copy_placement(state["preview_global"])
+                for state in self.target_states
+            ]
             self.snap_baseline_global = _copy_placement(self.preview_global)
             self.source_marker.hide()
             self.target_marker.hide()
             if self.last_screen_position is not None:
                 self._update_source_hover(self.last_screen_position)
             self._status(
-                "Grab Move: B mode — hover a point on the selected Body/ShapeBinder "
+                "Grab Move: B mode — hover a point on selected geometry "
                 "and click"
             )
             self._update_hud()
@@ -2050,21 +2203,32 @@ class GrabMoveSession(object):
             % (commit, self.phase, self.debug_event_count, self.debug_move_count)
         )
 
-        final_local = _copy_placement(self.obj.Placement)
+        final_locals = [
+            _copy_placement(state["obj"].Placement)
+            for state in self.target_states
+        ]
+        final_local = final_locals[0]
         _debug(
-            "final placement before transaction base=(%.3f, %.3f, %.3f)"
+            "final placement before transaction targets=%d primary_base=(%.3f, %.3f, %.3f)"
             % (
+                len(final_locals),
                 final_local.Base.x,
                 final_local.Base.y,
                 final_local.Base.z,
             )
         )
 
-        try:
-            if not commit:
-                self.obj.Placement = _copy_placement(self.original_local)
-        except Exception:
-            pass
+        if not commit:
+            for state in self.target_states:
+                try:
+                    state["obj"].Placement = _copy_placement(
+                        state["original_local"]
+                    )
+                except Exception:
+                    _debug(
+                        "could not restore cancelled target=%s:\n%s"
+                        % (_object_key(state["obj"]), traceback.format_exc())
+                    )
 
         if self.callback_id is not None:
             try:
@@ -2080,7 +2244,10 @@ class GrabMoveSession(object):
             # Apply the Body's final translation to its internal synchronized
             # Binders before recompute, so the PartDesign result does not
             # resolve back to the pre-grab location.
-            self._sync_body_binders(final_local)
+            for state, target_final_local in zip(
+                self.target_states, final_locals
+            ):
+                self._sync_body_binders(target_final_local, state)
             # Recompute while the transaction is still open. Some PartDesign
             # documents can refresh a Body during recompute; preserve the
             # final snapped Placement before committing the undo record.
@@ -2088,17 +2255,24 @@ class GrabMoveSession(object):
                 self.document.recompute()
             except Exception:
                 _debug("document recompute during commit failed:\n%s" % traceback.format_exc())
-            try:
-                if not _same_translation(self.obj.Placement, final_local):
+            for state, target_final_local in zip(
+                self.target_states, final_locals
+            ):
+                target = state["obj"]
+                try:
+                    if not _same_translation(target.Placement, target_final_local):
+                        _debug(
+                            "recompute changed final placement; restoring "
+                            "snapped placement target=%s"
+                            % (_object_key(target),)
+                        )
+                        target.Placement = _copy_placement(target_final_local)
+                except Exception:
                     _debug(
-                        "recompute changed final placement; restoring snapped placement"
+                        "could not restore final placement after recompute "
+                        "target=%s:\n%s"
+                        % (_object_key(target), traceback.format_exc())
                     )
-                    self.obj.Placement = _copy_placement(final_local)
-            except Exception:
-                _debug(
-                    "could not restore final placement after recompute:\n%s"
-                    % traceback.format_exc()
-                )
 
         if self.transaction_open:
             try:
@@ -2114,10 +2288,15 @@ class GrabMoveSession(object):
             self.transaction_open = False
 
         try:
-            finished_local = _copy_placement(self.obj.Placement)
+            finished_locals = [
+                _copy_placement(state["obj"].Placement)
+                for state in self.target_states
+            ]
+            finished_local = finished_locals[0]
             _debug(
-                "final placement after transaction base=(%.3f, %.3f, %.3f)"
+                "final placement after transaction targets=%d primary_base=(%.3f, %.3f, %.3f)"
                 % (
+                    len(finished_locals),
                     finished_local.Base.x,
                     finished_local.Base.y,
                     finished_local.Base.z,
@@ -2139,7 +2318,7 @@ class GrabMoveCommand(object):
         return {
             "MenuText": "Grab Move",
             "ToolTip": (
-                "Move a PartDesign Body or ShapeBinder with the mouse; "
+                "Move selected PartDesign Bodies or ShapeBinders with the mouse; "
                 "use B to pick a snap source"
             ),
             "Accel": "G",
@@ -2147,8 +2326,9 @@ class GrabMoveCommand(object):
         }
 
     def IsActive(self):
-        return getattr(App, SESSION_ATTRIBUTE, None) is None and (
-            _selected_moveable_object() is not None
+        return (
+            getattr(App, SESSION_ATTRIBUTE, None) is None
+            and bool(_selected_moveable_objects())
         )
 
     def Activated(self):
@@ -2157,11 +2337,10 @@ class GrabMoveCommand(object):
             _debug("command ignored: another session is active")
             return
 
-        selected_obj = _selected_object()
-        obj = _resolve_moveable_object(selected_obj)
-        if obj is None:
+        moveable_items = _selected_moveable_items()
+        if not moveable_items:
             try:
-                selection = list(Gui.Selection.getSelection())
+                selection = _selected_objects()
                 _debug(
                     "command ignored: selection=%s"
                     % [
@@ -2172,12 +2351,16 @@ class GrabMoveCommand(object):
             except Exception:
                 _debug("command ignored: selection could not be inspected")
             App.Console.PrintMessage(
-                "[GrabMove] Select one PartDesign Body or ShapeBinder first.\n"
+                "[GrabMove] Select one or more PartDesign Bodies or "
+                "ShapeBinders first.\n"
             )
             return
 
-        visual_obj = _body_for_object(selected_obj) or selected_obj
-        session = GrabMoveSession(obj, visual_obj=visual_obj)
+        moveable_objects = [item[0] for item in moveable_items]
+        visual_objects = [item[1] for item in moveable_items]
+        session = GrabMoveSession(
+            moveable_objects, visual_objects=visual_objects
+        )
         setattr(App, SESSION_ATTRIBUTE, session)
         _debug("session stored on App as %s" % SESSION_ATTRIBUTE)
         try:
@@ -2651,7 +2834,8 @@ def install_gui():
         action.setObjectName("GrabMove_MoveAction")
         action.setText("Grab Move")
         action.setToolTip(
-            "Grab Move (G): move a Body or ShapeBinder; B picks a snap source"
+            "Grab Move (G): move selected Bodies or ShapeBinders; "
+            "B picks a snap source"
         )
         try:
             icon = QtGui.QIcon(":/icons/Std_Transform.svg")
@@ -2695,10 +2879,10 @@ def install_gui():
 
     def refresh_enabled():
         try:
-            resolved = _selected_moveable_object()
+            resolved = _selected_moveable_objects()
             enabled = (
                 getattr(App, SESSION_ATTRIBUTE, None) is None
-                and resolved is not None
+                and bool(resolved)
             )
             action.setEnabled(bool(enabled))
             shortcut_action.setEnabled(bool(enabled))
@@ -2716,8 +2900,8 @@ def install_gui():
                     "selection=%s resolved=%s moveable=%s shortcut_enabled=%s"
                     % (
                         selection_state,
-                        _object_key(resolved) if resolved is not None else None,
-                        resolved is not None,
+                        [_object_key(item) for item in resolved],
+                        bool(resolved),
                         enabled,
                     )
                 )
@@ -2739,7 +2923,7 @@ def install_gui():
 def is_moveable_selection():
     """Used by the optional toolbar to update its enabled state."""
 
-    return _selected_moveable_object() is not None
+    return bool(_selected_moveable_objects())
 
 
 def install():
@@ -2761,5 +2945,6 @@ def install():
         raise
     _debug("Gui.addCommand registered %s with accelerator G" % COMMAND_NAME)
     App.Console.PrintMessage(
-        "[GrabMove] Loaded. Select a Body or ShapeBinder and press G.\n"
+        "[GrabMove] Loaded. Select one or more Bodies or ShapeBinders and "
+        "press G.\n"
     )
