@@ -41,6 +41,7 @@ COMMAND_NAME = "GrabMove_Move"
 SESSION_ATTRIBUTE = "_GrabMoveSession"
 COMMAND_ATTRIBUTE = "_GrabMoveCommand"
 INPUT_SUSPENDED_ATTRIBUTE = "_GrabMoveInputSuspended"
+INPUT_HANDLER_ATTRIBUTE = "_GrabMoveInputHandler"
 PARAMETER_PATH = "User parameter:BaseApp/Preferences/Mod/GrabMove"
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "GrabMove-debug.log")
@@ -79,6 +80,22 @@ def _input_suspended():
     try:
         return bool(getattr(App, INPUT_SUSPENDED_ATTRIBUTE, False))
     except Exception:
+        return False
+
+
+def _external_input_handler(key):
+    """Offer a suspended modal key to the tool that owns GrabMove input."""
+
+    handler = getattr(App, INPUT_HANDLER_ATTRIBUTE, None)
+    if not callable(handler):
+        return False
+    try:
+        return bool(handler(key))
+    except Exception:
+        _debug(
+            "external input handler failed for key=%s:\n%s"
+            % (key, traceback.format_exc())
+        )
         return False
 
 
@@ -2659,11 +2676,26 @@ def install_gui():
                             )
                         return False
 
+                    if _input_suspended():
+                        external_key = self._modal_key(event)
+                        if external_key in (
+                            "B", "ESCAPE", "RETURN", "ENTER"
+                        ):
+                            if _external_input_handler(external_key):
+                                return True
+                            _debug(
+                                "application key blocked: input is owned by another modal tool key=%s"
+                                % external_key
+                            )
+                            return True
+
                     key_g = _qt_enum(QtCore.Qt, "Key_G", "Key")
                     if event.key() != key_g:
                         return False
 
                     if _input_suspended():
+                        if _external_input_handler("G"):
+                            return True
                         _debug(
                             "application G ignored: input is owned by another modal tool"
                         )
@@ -2863,13 +2895,18 @@ def install_gui():
 
                     session = getattr(App, SESSION_ATTRIBUTE, None)
                     if session is None or getattr(session, "done", True):
-                        if key_name != "G" or not is_moveable_selection():
-                            return False, 0
-                        if _input_suspended():
+                        if _input_suspended() and key_name in (
+                            "G", "B", "ESCAPE", "ENTER", "RETURN"
+                        ):
+                            if _external_input_handler(key_name):
+                                return True, 0
                             _debug(
-                                "native G ignored: input is owned by another modal tool"
+                                "native key blocked: input is owned by another modal tool key=%s"
+                                % key_name
                             )
                             return True, 0
+                        if key_name != "G" or not is_moveable_selection():
+                            return False, 0
                         _debug("native application key captured key=G")
                         result = Gui.runCommand(COMMAND_NAME)
                         _debug(
