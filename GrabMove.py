@@ -208,6 +208,60 @@ def _linear_pattern_preview_available():
         return False
 
 
+def _linear_pattern_task_active():
+    """Return whether FreeCAD is currently editing a Linear Pattern.
+
+    A pattern task can still have a selected Body or feature behind its
+    temporary preview.  That selection must not make the ordinary G command
+    available while the native task is open.
+    """
+
+    controller = _linear_pattern_preview_controller()
+    pattern = getattr(controller, "_pattern", None)
+    try:
+        if pattern is not None and _text(pattern.TypeId) == (
+            "PartDesign::LinearPattern"
+        ):
+            return True
+    except Exception:
+        pass
+
+    documents = []
+    active_document = getattr(Gui, "ActiveDocument", None)
+    if active_document is not None:
+        documents.append(active_document)
+    try:
+        active_document = Gui.activeDocument()
+        if active_document is not None:
+            documents.append(active_document)
+    except Exception:
+        pass
+
+    seen = set()
+    for document in documents:
+        marker = id(document)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        getter = getattr(document, "getInEdit", None)
+        if not callable(getter):
+            continue
+        try:
+            value = getter()
+            if isinstance(value, (list, tuple)):
+                value = value[0] if value else None
+            obj = getattr(value, "Object", None) or getattr(value, "object", None)
+            if obj is None and hasattr(value, "TypeId"):
+                obj = value
+            if obj is not None and _text(obj.TypeId) == (
+                "PartDesign::LinearPattern"
+            ):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _document_for_object(obj):
     try:
         return obj.Document
@@ -4294,6 +4348,7 @@ class GrabMoveCommand(object):
     def IsActive(self):
         return (
             getattr(App, SESSION_ATTRIBUTE, None) is None
+            and not _linear_pattern_task_active()
             and bool(_selected_moveable_objects())
         )
 
@@ -4301,6 +4356,9 @@ class GrabMoveCommand(object):
         _debug("command Activated() called")
         if getattr(App, SESSION_ATTRIBUTE, None) is not None:
             _debug("command ignored: another session is active")
+            return
+        if _linear_pattern_task_active():
+            _debug("command ignored: Linear Pattern task is active")
             return
 
         moveable_items = _selected_moveable_items()
@@ -4551,6 +4609,11 @@ def install_gui():
                     )
                     if no_modifier is not None and event.modifiers() != no_modifier:
                         return False
+                    if _linear_pattern_task_active():
+                        _debug(
+                            "application G ignored: Linear Pattern task is active"
+                        )
+                        return True
                     if not is_moveable_selection():
                         _debug(
                             "application G received but no moveable selection"
@@ -4740,6 +4803,11 @@ def install_gui():
                         return False, 0
 
                     if session is None or getattr(session, "done", True):
+                        if key_name == "G" and _linear_pattern_task_active():
+                            _debug(
+                                "native G ignored: Linear Pattern task is active"
+                            )
+                            return True, 0
                         if key_name != "G" or not is_moveable_selection():
                             return False, 0
                         _debug("native application key captured key=G")
@@ -4848,6 +4916,7 @@ def install_gui():
             resolved = _selected_moveable_objects()
             enabled = (
                 getattr(App, SESSION_ATTRIBUTE, None) is None
+                and not _linear_pattern_task_active()
                 and bool(resolved)
             )
             action.setEnabled(bool(enabled))
