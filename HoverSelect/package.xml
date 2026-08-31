@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<package format="1">
+  <name>HoverSelect</name>
+  <description>Select and append Part Design Bodies by hovering and pressing L.</description>
+  <version>0.1.2</version>
+  <date>2026-08-31</date>
+  <author>Local installation</author>
+  <license>LGPL-2.1-or-later</license>
+</package>

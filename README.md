@@ -28,3 +28,7 @@ The addon is installed in the active FreeCAD user Mod directory. It uses
 FreeCAD's public view callbacks, `getObjectsInfo()`/`getObjectInfo()` hit
 testing, and `Placement` updates, so the document remains a normal FreeCAD
 document and the move is one undoable transaction.
+
+The repository also includes the companion `HoverSelect` addon. It selects the
+Body under the cursor with `L`, appends additional Bodies on later `L` presses,
+and expands/scrolls the tree to show the selected Bodies.
