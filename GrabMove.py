@@ -259,6 +259,21 @@ def _is_binder_object(obj):
     return "ShapeBinder" in _text(getattr(obj, "TypeId", ""))
 
 
+def _binder_tracks_support(binder):
+    """Return whether a binder follows placement changes of its support."""
+
+    type_id = _text(getattr(binder, "TypeId", ""))
+    if "SubShapeBinder" in type_id:
+        # SubShapeBinders always track the relative placement of their
+        # referenced geometry.
+        return True
+
+    try:
+        return bool(getattr(binder, "TraceSupport"))
+    except Exception:
+        return False
+
+
 def _linked_objects(value):
     """Yield document objects from Link, LinkSub, and LinkSubList values."""
 
@@ -1619,6 +1634,44 @@ class GrabMoveSession(object):
         except Exception:
             return None
 
+    def _moving_target_for_object(self, obj):
+        """Return the selected target that owns or matches ``obj``."""
+
+        if obj is None:
+            return None
+        owner = _body_for_object(obj)
+        for target in self.move_objects:
+            if _same_object(obj, target) or (
+                owner is not None and _same_object(owner, target)
+            ):
+                return target
+        return None
+
+    def _binder_follows_other_moving_target(self, binder, current_target):
+        """Check whether a binder already follows another selected target.
+
+        A traced ShapeBinder follows its support. If that support is another
+        selected Body, the support Body's shared translation already moves the
+        binder. Applying the Body-follow adjustment a second time would make
+        linked geometry drift apart, especially after a second axis move.
+        """
+
+        if not _binder_tracks_support(binder):
+            return False
+
+        try:
+            support = binder.Support
+        except Exception:
+            return False
+
+        for linked in _linked_objects(support):
+            moving_target = self._moving_target_for_object(linked)
+            if moving_target is not None and not _same_object(
+                moving_target, current_target
+            ):
+                return True
+        return False
+
     def _belongs_to_moving_object(self, obj):
         if obj is None:
             return False
@@ -1882,6 +1935,22 @@ class GrabMoveSession(object):
         )
 
         for binder, original in follow_binder_states:
+            if any(
+                _same_object(binder, target) for target in self.move_objects
+            ):
+                _debug(
+                    "body follow skipped selected binder=%s"
+                    % (_object_key(binder),)
+                )
+                continue
+            if self._binder_follows_other_moving_target(
+                binder, target_state["obj"]
+            ):
+                _debug(
+                    "body follow skipped traced linked binder=%s target=%s"
+                    % (_object_key(binder), _object_key(target_state["obj"]))
+                )
+                continue
             desired = _copy_placement(original)
             desired.Base = _copy_vector(original.Base) + body_delta
             try:
