@@ -176,34 +176,22 @@ def _tree_widgets(main_window):
     return tree_widgets or widgets
 
 
-def _walk_tree_item(item):
-    """Yield a QTreeWidgetItem and all of its descendants."""
+def _tree_find_items(tree, text, column):
+    """Use QTreeWidget's native search for FreeCAD's custom tree."""
 
-    if item is None:
-        return
-    yield item
+    if tree is None or not text:
+        return []
+    recursive = _qt_enum(QtCore.Qt, "MatchRecursive", "MatchFlag")
+    exact = _qt_enum(QtCore.Qt, "MatchExactly", "MatchFlag")
+    if recursive is None:
+        return []
+    flags = recursive
+    if exact is not None:
+        flags = flags | exact
     try:
-        children = [item.child(index) for index in range(item.childCount())]
+        return list(tree.findItems(text, flags, column))
     except Exception:
-        children = []
-    for child in children:
-        for descendant in _walk_tree_item(child):
-            yield descendant
-
-
-def _tree_items(tree):
-    """Yield all currently materialized items in a QTreeWidget."""
-
-    try:
-        roots = [
-            tree.topLevelItem(index)
-            for index in range(tree.topLevelItemCount())
-        ]
-    except Exception:
-        roots = []
-    for root in roots:
-        for item in _walk_tree_item(root):
-            yield item
+        return []
 
 
 def _tree_root_item(item):
@@ -237,48 +225,66 @@ def _tree_root_matches_document(item, document):
     return root_text in (document_label, document_name)
 
 
-def _tree_item_for_object(tree, obj):
-    """Find an object's tree row by FreeCAD's hidden internal-name column."""
+def _tree_matching_item(candidates, document=None, prefer_first=False):
+    """Choose a live row while the candidate list is still retained."""
 
-    if tree is None or obj is None:
-        return None
-    object_name = _text(getattr(obj, "Name", "")).strip()
-    if not object_name:
-        return None
-    document = getattr(obj, "Document", None)
-    exact = []
-    label_matches = []
-    object_label = _text(getattr(obj, "Label", "")).strip()
-    for item in _tree_items(tree):
-        try:
-            internal_name = _text(item.text(2)).strip()
-        except Exception:
-            internal_name = ""
-        if internal_name == object_name:
-            exact.append(item)
-            continue
-        if object_label and _text(item.text(0)).strip() == object_label:
-            label_matches.append(item)
-
-    for item in exact:
+    # Internal FreeCAD object names are the most reliable identifier. Avoid
+    # walking parent wrappers for this common case: Gui::TreeWidget can
+    # rebuild those wrappers while a branch is being opened.
+    if prefer_first and candidates:
+        return candidates[0]
+    for item in candidates:
         if _tree_root_matches_document(item, document):
             return item
-    if exact:
-        return exact[0]
-
-    for item in label_matches:
-        if _tree_root_matches_document(item, document):
-            return item
-    if len(label_matches) == 1:
-        return label_matches[0]
+    if len(candidates) == 1:
+        return candidates[0]
     return None
 
 
-def _tree_document_item(tree, document):
-    """Find the top-level document row that owns an object."""
+def _tree_object_candidates(tree, obj):
+    """Return live row candidates and whether they used an internal name."""
+
+    if tree is None or obj is None:
+        return [], False
+    object_name = _text(getattr(obj, "Name", "")).strip()
+    if not object_name:
+        return [], False
+    exact = _tree_find_items(tree, object_name, 2)
+    if exact:
+        return exact, True
+    object_label = _text(getattr(obj, "Label", "")).strip()
+    return _tree_find_items(tree, object_label, 0), False
+
+
+def _tree_has_object_row(tree, obj):
+    candidates, prefer_first = _tree_object_candidates(tree, obj)
+    return _tree_matching_item(
+        candidates, getattr(obj, "Document", None), prefer_first
+    ) is not None
+
+
+def _tree_scroll_to_object(tree, obj):
+    """Find and scroll to an object while its native candidate list is live."""
+
+    candidates, prefer_first = _tree_object_candidates(tree, obj)
+    item = _tree_matching_item(
+        candidates, getattr(obj, "Document", None), prefer_first
+    )
+    if item is None:
+        return False
+    try:
+        tree.scrollToItem(item)
+        return True
+    except Exception:
+        _debug("tree reveal scroll failed:\n%s" % traceback.format_exc())
+        return False
+
+
+def _tree_expand_document(tree, document):
+    """Expand a document row while retaining its candidate list."""
 
     if tree is None or document is None:
-        return None
+        return False
     labels = {
         _text(getattr(document, "Label", "")).strip(),
         _text(getattr(document, "Name", "")).strip(),
@@ -295,14 +301,28 @@ def _tree_document_item(tree, document):
                 candidates.append(item)
         except Exception:
             pass
-    if candidates:
-        return candidates[0]
-    if count == 1:
+    if not candidates and count == 1:
         try:
-            return tree.topLevelItem(0)
+            candidates.append(tree.topLevelItem(0))
         except Exception:
             pass
-    return None
+    if not candidates:
+        return False
+    _expand_tree_item(candidates[0])
+    return True
+
+
+def _tree_expand_object_row(tree, obj):
+    """Expand a model container using its live native tree row."""
+
+    candidates, prefer_first = _tree_object_candidates(tree, obj)
+    item = _tree_matching_item(
+        candidates, getattr(obj, "Document", None), prefer_first
+    )
+    if item is None:
+        return False
+    _expand_tree_item(item)
+    return True
 
 
 def _group_parent_for_object(obj):
@@ -353,49 +373,18 @@ def _expand_tree_item(item):
         pass
 
 
-def _expand_tree_ancestors(item):
-    parent = None
-    try:
-        parent = item.parent()
-    except Exception:
-        pass
-    while parent is not None:
-        _expand_tree_item(parent)
-        try:
-            parent = parent.parent()
-        except Exception:
-            parent = None
-
-
 def _reveal_tree_object(tree, obj):
-    """Expand the containing path and return the object's tree row."""
-
-    item = _tree_item_for_object(tree, obj)
-    if item is not None:
-        _expand_tree_ancestors(item)
-        return item
+    """Expand the containing path and report whether the row exists."""
 
     document = getattr(obj, "Document", None)
-    document_item = _tree_document_item(tree, document)
-    if document_item is not None:
-        _expand_tree_item(document_item)
-        item = _tree_item_for_object(tree, obj)
-        if item is not None:
-            _expand_tree_ancestors(item)
-            return item
+    _tree_expand_document(tree, document)
 
     # Tree rows inside collapsed groups may not exist until their parent is
-    # expanded. Follow the same group/Part chain used by the model tree.
+    # expanded. Follow the model's real container chain instead of holding
+    # parent QTreeWidgetItem wrappers across branch rebuilds.
     for container in _object_container_chain(obj):
-        container_item = _tree_item_for_object(tree, container)
-        if container_item is None:
-            break
-        _expand_tree_item(container_item)
-        item = _tree_item_for_object(tree, obj)
-        if item is not None:
-            _expand_tree_ancestors(item)
-            return item
-    return None
+        _tree_expand_object_row(tree, container)
+    return _tree_has_object_row(tree, obj)
 
 
 def _record_value(record, name):
@@ -667,9 +656,12 @@ class HoverSelectRuntime(QtCore.QObject):
         found = []
         for body in bodies:
             for tree in widgets:
-                item = _reveal_tree_object(tree, body)
-                if item is not None:
-                    found.append((body, tree, item))
+                if _reveal_tree_object(tree, body):
+                    # Keep only the tree widget and model object. Expanding a
+                    # native FreeCAD row can delete and recreate the item;
+                    # the item itself must be looked up again just before
+                    # scrolling.
+                    found.append((body, tree))
                     break
 
         if not found:
@@ -686,14 +678,15 @@ class HoverSelectRuntime(QtCore.QObject):
                 break
         if target is None:
             target = found[-1]
-        try:
-            target[1].scrollToItem(target[2])
-        except Exception:
-            _debug("tree reveal scroll failed:\n%s" % traceback.format_exc())
+        if not _tree_scroll_to_object(target[1], target[0]):
+            _debug(
+                "tree reveal row disappeared before scroll body=%s"
+                % (_object_key(target[0]),)
+            )
         _debug(
             "tree path revealed bodies=%s focused=%s"
             % (
-                [_object_key(body) for body, _tree, _item in found],
+                [_object_key(body) for body, _tree in found],
                 _object_key(target[0]),
             )
         )
